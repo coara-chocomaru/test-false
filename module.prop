@@ -1,0 +1,6 @@
+id=journey_customer_fix
+name=Journey Customer Fix
+version=1.0
+versionCode=1
+author=coara-chocomaru
+description=Force ro.boot.journey.customer to false
