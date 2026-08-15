@@ -3,12 +3,11 @@ name: QCOM Bootloader Full Recursive Disassembly & Analysis
 on:
   push:
     branches:
-      - main
-      - dev
+      - a 
 
   pull_request:
     branches:
-      - main
+      - a
 
   workflow_dispatch:
     inputs:
@@ -16,7 +15,7 @@ on:
         description: ZIP URL
         required: true
         type: string
-        default: https://github.com/coara-chocomaru/monooki/raw/refs/heads/main/wish2.zip
+        default: https://github.com/coara-chocomaru/test-false/raw/refs/heads/a/armeabi-v7a.zip
 
 jobs:
   full-disassembly:
@@ -27,7 +26,7 @@ jobs:
       options: --privileged
 
     env:
-      ZIP_URL: ${{ github.event.inputs.zip_url || 'https://github.com/coara-chocomaru/monooki/raw/refs/heads/main/wish2.zip' }}
+      ZIP_URL: ${{ github.event.inputs.zip_url || 'https://github.com/coara-chocomaru/test-false/raw/refs/heads/a/armeabi-v7a.zip' }}
       PYTHONUNBUFFERED: "1"
       PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
       LD_LIBRARY_PATH: /usr/local/lib:/usr/lib:/lib
