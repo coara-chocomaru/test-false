@@ -15,7 +15,7 @@ on:
         description: ZIP URL
         required: true
         type: string
-        default: https://github.com/coara-chocomaru/test-false/raw/refs/heads/a/armeabi-v7a.zip
+        default: https://github.com/coara-chocomaru/test-false/raw/refs/heads/a/kdiag_common.zip
 
 jobs:
   full-disassembly:
