@@ -1,14 +1,6 @@
 name: Kernel Offset Discovery
 
 on:
-  push:
-    branches:
-      - a 
-
-  pull_request:
-    branches:
-      - a
-
   workflow_dispatch:
     inputs:
       kernel_url:
@@ -165,12 +157,11 @@ jobs:
           file "${ANALYSIS_ROOT}/input/kernel.download"
           sha256sum "${ANALYSIS_ROOT}/input/kernel.download" > "${ARTIFACT_ROOT}/logs/source_sha256.txt"
           md5sum "${ANALYSIS_ROOT}/input/kernel.download" > "${ARTIFACT_ROOT}/logs/source_md5.txt"
-          # Prepare extraction
+          # If it's a zip, extract and find the kernel file
           mkdir -p "${ANALYSIS_ROOT}/input/extract"
-          # If it's a zip, unzip and find the contained kernel file
           if file "${ANALYSIS_ROOT}/input/kernel.download" | grep -q "Zip archive"; then
             unzip -q "${ANALYSIS_ROOT}/input/kernel.download" -d "${ANALYSIS_ROOT}/input/extract"
-            # Find a likely kernel file (largest, or named kernel-dtb.gz, etc.)
+            # Find the largest file or likely kernel image (e.g., contains kernel-dtb.gz)
             KERNEL_FILE=$(find "${ANALYSIS_ROOT}/input/extract" -type f -size +1M | head -1)
             if [ -z "${KERNEL_FILE}" ]; then
               echo "No large file found in zip"
@@ -180,28 +171,35 @@ jobs:
           else
             cp "${ANALYSIS_ROOT}/input/kernel.download" "${ANALYSIS_ROOT}/input/kernel_image_raw"
           fi
-          # Now kernel_image_raw might be a gzip (or xz) compressed kernel+dtb, or just a kernel image
-          # Try to gunzip if it's gzip
+          # Decompress if gzipped
           if file "${ANALYSIS_ROOT}/input/kernel_image_raw" | grep -q "gzip compressed"; then
             gunzip -c "${ANALYSIS_ROOT}/input/kernel_image_raw" > "${ANALYSIS_ROOT}/input/kernel_image_uncompressed"
           else
             cp "${ANALYSIS_ROOT}/input/kernel_image_raw" "${ANALYSIS_ROOT}/input/kernel_image_uncompressed"
           fi
-          # Now split by DTB magic if present
-          DTB_MAGIC="D0 0D FE ED"
-          if strings -t x "${ANALYSIS_ROOT}/input/kernel_image_uncompressed" | grep -qi "D0 0D FE ED"; then
-            # Find offset of DTB magic
-            OFFSET=$(od -An -v -tx1 "${ANALYSIS_ROOT}/input/kernel_image_uncompressed" | tr -d '\n' | grep -bo "$(echo -n "$DTB_MAGIC" | xxd -r -p)" | head -1 | cut -d: -f1)
-            if [ -n "${OFFSET}" ]; then
-              dd if="${ANALYSIS_ROOT}/input/kernel_image_uncompressed" of="${ANALYSIS_ROOT}/input/zImage" bs=1 count="${OFFSET}" 2>/dev/null
-              dd if="${ANALYSIS_ROOT}/input/kernel_image_uncompressed" of="${ANALYSIS_ROOT}/input/dtb" bs=1 skip="${OFFSET}" 2>/dev/null
-              echo "Split zImage and dtb at offset ${OFFSET}"
-            fi
-          else
-            # No DTB magic, assume the whole file is the kernel
-            cp "${ANALYSIS_ROOT}/input/kernel_image_uncompressed" "${ANALYSIS_ROOT}/input/zImage"
-          fi
-          # Ensure we have a zImage file
+          # Split by DTB magic using Python (reliable)
+          python3 - <<'SPLIT_SCRIPT'
+          import os, sys
+          infile = os.environ['ANALYSIS_ROOT'] + '/input/kernel_image_uncompressed'
+          out_zimage = os.environ['ANALYSIS_ROOT'] + '/input/zImage'
+          out_dtb = os.environ['ANALYSIS_ROOT'] + '/input/dtb'
+          with open(infile, 'rb') as f:
+              data = f.read()
+          magic = b'\xd0\x0d\xfe\xed'
+          idx = data.find(magic)
+          if idx != -1:
+              with open(out_zimage, 'wb') as f:
+                  f.write(data[:idx])
+              with open(out_dtb, 'wb') as f:
+                  f.write(data[idx:])
+              print(f"Split zImage and dtb at offset {idx}")
+          else:
+              # No DTB magic, assume whole file is zImage
+              with open(out_zimage, 'wb') as f:
+                  f.write(data)
+              print("No DTB magic found; using whole file as zImage")
+          SPLIT_SCRIPT
+          # Ensure zImage exists
           if [ ! -s "${ANALYSIS_ROOT}/input/zImage" ]; then
             echo "Failed to obtain zImage"
             exit 1
@@ -257,13 +255,10 @@ jobs:
               except:
                   return None
           def extract_vmlinux_from_zimage(zimage_path):
-              # Read the whole file
               with open(zimage_path,"rb") as f:
                   data=f.read()
-              # 1. Check if it's already ELF
               if data.startswith(ELF_MAGIC):
                   return str(zimage_path)
-              # 2. Try to find gzip magic and decompress
               gzip_off=data.find(GZIP_MAGIC)
               if gzip_off!=-1:
                   gzip_data=data[gzip_off:]
@@ -274,7 +269,6 @@ jobs:
                       with open(out,"wb") as f:
                           f.write(decomp)
                       return str(out)
-              # 3. Try xz
               xz_off=data.find(XZ_MAGIC)
               if xz_off!=-1:
                   xz_data=data[xz_off:]
@@ -285,7 +279,6 @@ jobs:
                       with open(out,"wb") as f:
                           f.write(decomp)
                       return str(out)
-              # 4. Try binwalk
               outdir=EXTRACT_ROOT/"binwalk_extract"
               shutil.rmtree(outdir,ignore_errors=True)
               outdir.mkdir(parents=True,exist_ok=True)
@@ -297,7 +290,6 @@ jobs:
                           with open(p,"rb") as fd:
                               if fd.read(4)==ELF_MAGIC:
                                   return p
-              # 5. Search entire file for ELF magic and extract from there
               offset=find_magic(data, ELF_MAGIC)
               if offset!=-1:
                   elf_data=data[offset:]
