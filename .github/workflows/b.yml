@@ -1,0 +1,481 @@
+name: Kernel Offset Discovery
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_url:
+        description: URL to kernel-dtb.gz
+        required: true
+        type: string
+        default: https://github.com/coara-chocomaru/test-false/raw/refs/heads/a/armeabi-v7a2.zip
+
+jobs:
+  analyze-kernel:
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:22.04
+      options: --privileged
+    env:
+      KERNEL_URL: ${{ github.event.inputs.kernel_url || 'https://github.com/coara-chocomaru/test-false/raw/refs/heads/a/armeabi-v7a2.zip' }}
+      PYTHONUNBUFFERED: "1"
+      PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      LD_LIBRARY_PATH: /usr/local/lib:/usr/lib:/lib
+    steps:
+      - name: Install Base Packages
+        shell: bash
+        run: |
+          set -e
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -y
+          apt-get install -y --no-install-recommends ca-certificates curl wget git libc-bin libgcc-s1 libstdc++6
+          apt-get clean
+          rm -rf /var/lib/apt/lists/*
+          if ! command -v git >/dev/null 2>&1; then echo "git not found"; exit 1; fi
+          if ! command -v curl >/dev/null 2>&1; then echo "curl not found"; exit 1; fi
+          ldconfig --version
+      - name: Determine Container Workspace
+        shell: bash
+        run: |
+          set -e
+          WORKSPACE_ROOT="$(pwd)"
+          if [ ! -d "${WORKSPACE_ROOT}" ]; then echo "Workspace does not exist: ${WORKSPACE_ROOT}"; exit 1; fi
+          echo "WORKSPACE_ROOT=${WORKSPACE_ROOT}" >> "${GITHUB_ENV}"
+          echo "ANALYSIS_ROOT=${WORKSPACE_ROOT}/analysis" >> "${GITHUB_ENV}"
+          echo "ARTIFACT_ROOT=${WORKSPACE_ROOT}/artifacts" >> "${GITHUB_ENV}"
+          echo "Detected container workspace: ${WORKSPACE_ROOT}"
+      - name: Initialize Directories
+        shell: bash
+        run: |
+          set -e
+          mkdir -p "${ANALYSIS_ROOT}/input" "${ANALYSIS_ROOT}/files" "${ANALYSIS_ROOT}/extracted" "${ANALYSIS_ROOT}/work" \
+                   "${ARTIFACT_ROOT}/logs" "${ARTIFACT_ROOT}/reports" "${ARTIFACT_ROOT}/reports/files" \
+                   "${ARTIFACT_ROOT}/reports/disassembly" "${ARTIFACT_ROOT}/raw"
+          test -d "${ANALYSIS_ROOT}"
+          test -d "${ARTIFACT_ROOT}"
+          {
+            echo "workflow_started=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "github_run_id=${GITHUB_RUN_ID}"
+            echo "github_repository=${GITHUB_REPOSITORY}"
+            echo "github_ref=${GITHUB_REF}"
+            echo "workspace_root=${WORKSPACE_ROOT}"
+            echo "analysis_root=${ANALYSIS_ROOT}"
+            echo "artifact_root=${ARTIFACT_ROOT}"
+            echo "kernel_url=${KERNEL_URL}"
+          } > "${ARTIFACT_ROOT}/logs/workflow_status.txt"
+          echo "Workspace: $(pwd)"
+      - name: Install Analysis Packages
+        shell: bash
+        run: |
+          set -e
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -y
+          apt-get install -y --no-install-recommends unzip zip tar gzip bzip2 xz-utils zstd lz4 p7zip-full p7zip-rar \
+            file binutils build-essential gcc g++ make cmake pkg-config autoconf automake libtool attr python3 python3-pip \
+            python3-dev python3-setuptools python3-wheel python3-venv default-jdk-headless binwalk liblzma-dev libmagic1 \
+            gdb-multiarch qemu-user-static bsdmainutils bsdextrautils libc-bin
+          apt-get clean
+          rm -rf /var/lib/apt/lists/*
+          for cmd in python3 pip3 gcc g++ make cmake file strings 7z unzip tar xz gzip bzip2 binwalk ldconfig; do
+            if ! command -v "${cmd}" >/dev/null 2>&1; then echo "Missing: ${cmd}"; exit 1; fi
+          done
+          python3 --version
+          gcc --version | head -n 1
+          ldconfig --version | head -n 1
+      - name: Record Environment
+        shell: bash
+        run: |
+          set -e
+          {
+            echo "===== DATE ====="; date -u
+            echo "===== UNAME ====="; uname -a
+            echo "===== CPU ====="; nproc
+            echo "===== MEMORY ====="; free -h
+            echo "===== DISK ====="; df -h
+            echo "===== PWD ====="; pwd
+            echo "===== WORKSPACE_ROOT ====="; echo "${WORKSPACE_ROOT}"
+            echo "===== ANALYSIS_ROOT ====="; echo "${ANALYSIS_ROOT}"
+            echo "===== ARTIFACT_ROOT ====="; echo "${ARTIFACT_ROOT}"
+            echo "===== PATH ====="; echo "${PATH}"
+            echo "===== LD_LIBRARY_PATH ====="; echo "${LD_LIBRARY_PATH}"
+            echo "===== COMMAND PATHS ====="
+            command -v python3; command -v gcc; command -v g++; command -v make; command -v cmake; command -v file
+            command -v strings; command -v 7z; command -v unzip; command -v tar; command -v xz; command -v gzip
+            command -v bzip2; command -v binwalk; command -v ldconfig
+            echo "===== PYTHON ====="; python3 --version
+            echo "===== GCC ====="; gcc --version | head -n 1
+            echo "===== LD CONFIG ====="; ldconfig --version | head -n 1
+          } | tee "${ARTIFACT_ROOT}/logs/environment.txt"
+      - name: Build Radare2
+        shell: bash
+        run: |
+          set -e
+          rm -rf /tmp/radare2
+          git clone --depth 1 https://github.com/radareorg/radare2.git /tmp/radare2
+          cd /tmp/radare2
+          ./configure --prefix=/usr/local
+          make -j"$(nproc)"
+          make install
+          cd /
+          rm -rf /tmp/radare2
+          export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+          export LD_LIBRARY_PATH="/usr/local/lib:/usr/lib:/lib"
+          ldconfig
+          if ! command -v r2 >/dev/null 2>&1; then echo "r2 missing"; exit 1; fi
+          if ! command -v rabin2 >/dev/null 2>&1; then echo "rabin2 missing"; exit 1; fi
+          r2 -v
+          rabin2 -v
+          {
+            echo "r2=$(command -v r2)"
+            echo "rabin2=$(command -v rabin2)"
+            r2 -v
+            rabin2 -v
+          } > "${ARTIFACT_ROOT}/logs/radare2.txt"
+      - name: Install Python Libraries
+        shell: bash
+        run: |
+          set -e
+          python3 -m pip install --upgrade pip setuptools wheel
+          python3 -m pip install r2pipe pefile capstone pyelftools pycryptodome unicorn python-magic
+          python3 - <<'PYEOF'
+          import importlib
+          for m in ["r2pipe","pefile","capstone","elftools","Crypto","unicorn","magic"]:
+              importlib.import_module(m)
+              print("OK:", m)
+          PYEOF
+      - name: Download Kernel Image
+        shell: bash
+        run: |
+          set -e
+          if [ -z "${KERNEL_URL}" ]; then echo "KERNEL_URL empty"; exit 1; fi
+          rm -f "${ANALYSIS_ROOT}/input/kernel-dtb.gz"
+          curl --fail --location --retry 10 --retry-delay 5 --retry-all-errors --connect-timeout 30 --max-time 3600 \
+               --output "${ANALYSIS_ROOT}/input/kernel-dtb.gz" "${KERNEL_URL}"
+          if [ ! -f "${ANALYSIS_ROOT}/input/kernel-dtb.gz" ]; then echo "Download failed"; exit 1; fi
+          SIZE=$(stat -c '%s' "${ANALYSIS_ROOT}/input/kernel-dtb.gz")
+          if [ "${SIZE}" -le 0 ]; then echo "Empty file"; exit 1; fi
+          echo "Size=${SIZE}"
+          file "${ANALYSIS_ROOT}/input/kernel-dtb.gz"
+          sha256sum "${ANALYSIS_ROOT}/input/kernel-dtb.gz" > "${ARTIFACT_ROOT}/logs/source_sha256.txt"
+          md5sum "${ANALYSIS_ROOT}/input/kernel-dtb.gz" > "${ARTIFACT_ROOT}/logs/source_md5.txt"
+          gunzip -c "${ANALYSIS_ROOT}/input/kernel-dtb.gz" > "${ANALYSIS_ROOT}/input/kernel-dtb"
+          if [ ! -s "${ANALYSIS_ROOT}/input/kernel-dtb" ]; then echo "Gunzip failed"; exit 1; fi
+          file "${ANALYSIS_ROOT}/input/kernel-dtb"
+      - name: Create Kernel Analysis Script
+        shell: bash
+        run: |
+          set -e
+          cat > /tmp/kernel_analysis.py <<'PYEOF'
+          import os,sys,json,shutil,subprocess,re,hashlib,traceback
+          from pathlib import Path
+          import r2pipe
+
+          ANALYSIS_ROOT=Path(os.environ["ANALYSIS_ROOT"])
+          ARTIFACT_ROOT=Path(os.environ["ARTIFACT_ROOT"])
+          KERNEL_DTB=ANALYSIS_ROOT/"input/kernel-dtb"
+          FILES_ROOT=ANALYSIS_ROOT/"files"
+          EXTRACT_ROOT=ANALYSIS_ROOT/"extracted"
+          WORK_ROOT=ANALYSIS_ROOT/"work"
+          REPORT_ROOT=ARTIFACT_ROOT/"reports"
+          RAW_ROOT=ARTIFACT_ROOT/"raw"
+          LOG_ROOT=ARTIFACT_ROOT/"logs"
+          READ_CHUNK=1024*1024
+          DTB_MAGIC=b'\xD0\x0D\xFE\xED'
+
+          def run_cmd(cmd,timeout=300):
+              try:
+                  r=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,errors="replace",timeout=timeout)
+                  return (r.returncode,r.stdout)
+              except subprocess.TimeoutExpired as e:
+                  return (124,(e.stdout if e.stdout else "")+"\nTIMEOUT\n")
+              except Exception as e:
+                  return (125,str(e))
+
+          def sha256_file(p):
+              h=hashlib.sha256()
+              with open(p,"rb") as f:
+                  while True:
+                      c=f.read(READ_CHUNK)
+                      if not c: break
+                      h.update(c)
+              return h.hexdigest()
+
+          def split_dtb(file_path):
+              with open(file_path,"rb") as f:
+                  data=f.read()
+              idx=data.find(DTB_MAGIC)
+              if idx==-1:
+                  return None,None
+              zimage=data[:idx]
+              dtb=data[idx:]
+              zimage_path=FILES_ROOT/"zImage"
+              dtb_path=FILES_ROOT/"dtb"
+              zimage_path.parent.mkdir(exist_ok=True)
+              with open(zimage_path,"wb") as f: f.write(zimage)
+              with open(dtb_path,"wb") as f: f.write(dtb)
+              return str(zimage_path),str(dtb_path)
+
+          def extract_vmlinux(zimage_path):
+              outdir=EXTRACT_ROOT/"vmlinux_extract"
+              shutil.rmtree(outdir,ignore_errors=True)
+              outdir.mkdir(parents=True,exist_ok=True)
+              code,out=run_cmd(["binwalk","-Me","--run-as=root","--directory="+str(outdir),str(zimage_path)],1800)
+              candidates=[]
+              for root,_,files in os.walk(outdir):
+                  for f in files:
+                      p=os.path.join(root,f)
+                      if os.path.isfile(p):
+                          with open(p,"rb") as fd:
+                              magic=fd.read(4)
+                          if magic==b'\x7fELF':
+                              candidates.append(p)
+              if candidates:
+                  return candidates[0]
+              return None
+
+          def r2_cmdj(r2,cmd):
+              try:
+                  v=r2.cmdj(cmd)
+                  return v if v is not None else []
+              except:
+                  return []
+
+          def find_symbol(r2,name):
+              syms=r2_cmdj(r2,"isj")
+              for s in syms:
+                  if s.get("name","")==name:
+                      return s.get("vaddr")
+              return None
+
+          def find_string_xref(r2,string):
+              strings=r2_cmdj(r2,"izzj")
+              addr=None
+              for s in strings:
+                  if s.get("string","")==string:
+                      addr=s.get("vaddr")
+                      break
+              if addr is None:
+                  return None
+              xrefs=r2_cmdj(r2,"axtj "+hex(addr))
+              if not xrefs:
+                  return None
+              for x in xrefs:
+                  if x.get("type")=="CALL" or x.get("type")=="DATA":
+                      return x.get("addr")
+              return None
+
+          def get_function_disasm(r2,addr):
+              return r2.cmd("pdf @ "+hex(addr))
+
+          def find_offset_after_current(disasm,reg):
+              lines=disasm.split('\n')
+              found_gs=False
+              for i,line in enumerate(lines):
+                  if "gs:" in line and "mov" in line and reg in line:
+                      found_gs=True
+                      continue
+                  if found_gs and "mov" in line and reg in line and "["+reg in line:
+                      m=re.search(r"\["+reg+r"\+0x([0-9a-fA-F]+)\]",line)
+                      if m:
+                          return int(m.group(1),16)
+              return None
+
+          def analyze_vmlinux(vmlinux_path):
+              r2=None
+              try:
+                  r2=r2pipe.open(str(vmlinux_path),flags=["-2"])
+              except Exception as e:
+                  return {"error":"open failed: "+str(e)}
+              try:
+                  r2.cmd("aaa")
+                  r2.cmd("aac")
+              except:
+                  pass
+              result={}
+              init_nsproxy=find_symbol(r2,"init_nsproxy")
+              selinux_enforcing=find_symbol(r2,"selinux_enforcing")
+              if init_nsproxy is None:
+                  init_nsproxy=find_string_xref(r2,"init_nsproxy")
+              if selinux_enforcing is None:
+                  selinux_enforcing=find_string_xref(r2,"selinux_enforcing")
+              result["init_nsproxy"]=init_nsproxy
+              result["selinux_enforcing"]=selinux_enforcing
+              offsets={}
+              syscalls=["sys_getpid","__x64_sys_getpid","__se_sys_getpid"]
+              for name in syscalls:
+                  addr=find_symbol(r2,name)
+                  if addr:
+                      dis=get_function_disasm(r2,addr)
+                      off=find_offset_after_current(dis,"rax")
+                      if off is not None:
+                          offsets["task_struct.pid"]=off
+                          break
+              syscalls_uid=["sys_getuid","__x64_sys_getuid","__se_sys_getuid"]
+              for name in syscalls_uid:
+                  addr=find_symbol(r2,name)
+                  if addr:
+                      dis=get_function_disasm(r2,addr)
+                      off=find_offset_after_current(dis,"rax")
+                      if off is not None:
+                          offsets["cred.uid"]=off
+                          break
+              if "cred.uid" in offsets:
+                  uid_off=offsets["cred.uid"]
+              else:
+                  uid_off=None
+              syscalls_gid=["sys_getgid","__x64_sys_getgid","__se_sys_getgid"]
+              for name in syscalls_gid:
+                  addr=find_symbol(r2,name)
+                  if addr:
+                      dis=get_function_disasm(r2,addr)
+                      off=find_offset_after_current(dis,"rax")
+                      if off is not None:
+                          offsets["cred.gid"]=off
+                          break
+              syscalls_euid=["sys_geteuid","__x64_sys_geteuid","__se_sys_geteuid"]
+              for name in syscalls_euid:
+                  addr=find_symbol(r2,name)
+                  if addr:
+                      dis=get_function_disasm(r2,addr)
+                      off=find_offset_after_current(dis,"rax")
+                      if off is not None:
+                          offsets["cred.euid"]=off
+                          break
+              syscalls_egid=["sys_getegid","__x64_sys_getegid","__se_sys_getegid"]
+              for name in syscalls_egid:
+                  addr=find_symbol(r2,name)
+                  if addr:
+                      dis=get_function_disasm(r2,addr)
+                      off=find_offset_after_current(dis,"rax")
+                      if off is not None:
+                          offsets["cred.egid"]=off
+                          break
+              syscalls_fsuid=["sys_getfsuid","__x64_sys_getfsuid","__se_sys_getfsuid"]
+              for name in syscalls_fsuid:
+                  addr=find_symbol(r2,name)
+                  if addr:
+                      dis=get_function_disasm(r2,addr)
+                      off=find_offset_after_current(dis,"rax")
+                      if off is not None:
+                          offsets["cred.fsuid"]=off
+                          break
+              syscalls_fsgid=["sys_getfsgid","__x64_sys_getfsgid","__se_sys_getfsgid"]
+              for name in syscalls_fsgid:
+                  addr=find_symbol(r2,name)
+                  if addr:
+                      dis=get_function_disasm(r2,addr)
+                      off=find_offset_after_current(dis,"rax")
+                      if off is not None:
+                          offsets["cred.fsgid"]=off
+                          break
+              syscalls_nsproxy=["sys_setns","__x64_sys_setns","__se_sys_setns"]
+              for name in syscalls_nsproxy:
+                  addr=find_symbol(r2,name)
+                  if addr:
+                      dis=get_function_disasm(r2,addr)
+                      off=find_offset_after_current(dis,"rax")
+                      if off is not None:
+                          offsets["task_struct.nsproxy"]=off
+                          break
+              syscalls_addr_limit=["sys_prctl","__x64_sys_prctl","__se_sys_prctl"]
+              for name in syscalls_addr_limit:
+                  addr=find_symbol(r2,name)
+                  if addr:
+                      dis=get_function_disasm(r2,addr)
+                      off=find_offset_after_current(dis,"rax")
+                      if off is not None:
+                          offsets["task_struct.addr_limit"]=off
+                          break
+              result["offsets"]=offsets
+              try:
+                  r2.quit()
+              except:
+                  pass
+              return result
+
+          def main():
+              for d in [FILES_ROOT,EXTRACT_ROOT,WORK_ROOT,REPORT_ROOT,RAW_ROOT,LOG_ROOT]:
+                  d.mkdir(parents=True,exist_ok=True)
+              if not KERNEL_DTB.is_file() or KERNEL_DTB.stat().st_size==0:
+                  print("kernel-dtb missing or empty"); return 1
+              zimg,dtb=split_dtb(str(KERNEL_DTB))
+              if zimg is None:
+                  print("DTB magic not found"); return 2
+              print("zImage:",zimg,"dtb:",dtb)
+              vmlinux=extract_vmlinux(zimg)
+              if vmlinux is None:
+                  print("vmlinux extraction failed"); return 3
+              print("vmlinux:",vmlinux)
+              analysis=analyze_vmlinux(vmlinux)
+              report=REPORT_ROOT/"kernel_offsets.json"
+              with open(report,"w") as f:
+                  json.dump(analysis,f,indent=2)
+              print("Analysis complete")
+              return 0
+          if __name__=="__main__":
+              sys.exit(main())
+          PYEOF
+          python3 -m py_compile /tmp/kernel_analysis.py
+          chmod +x /tmp/kernel_analysis.py
+      - name: Run Kernel Analysis
+        shell: bash
+        run: |
+          set -e
+          python3 /tmp/kernel_analysis.py 2>&1 | tee "${ARTIFACT_ROOT}/logs/analysis.log"
+      - name: Validate Results
+        shell: bash
+        run: |
+          set -e
+          if [ ! -f "${ARTIFACT_ROOT}/reports/kernel_offsets.json" ]; then echo "Missing kernel_offsets.json"; exit 1; fi
+          python3 - <<'PYEOF'
+          import json,os
+          with open(os.environ["ARTIFACT_ROOT"]+"/reports/kernel_offsets.json") as f:
+              data=json.load(f)
+          print("init_nsproxy:",data.get("init_nsproxy"))
+          print("selinux_enforcing:",data.get("selinux_enforcing"))
+          print("offsets:",data.get("offsets"))
+          PYEOF
+      - name: Collect Diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          mkdir -p "${ARTIFACT_ROOT}/logs"
+          {
+            echo "===== DATE ====="; date -u
+            echo "===== PWD ====="; pwd
+            echo "===== WORKSPACE_ROOT ====="; echo "${WORKSPACE_ROOT}"
+            echo "===== ANALYSIS_ROOT ====="; echo "${ANALYSIS_ROOT}"
+            echo "===== ARTIFACT_ROOT ====="; echo "${ARTIFACT_ROOT}"
+            echo "===== UNAME ====="; uname -a
+            echo "===== CPU ====="; nproc
+            echo "===== MEMORY ====="; free -h
+            echo "===== DISK ====="; df -h
+            echo "===== TOOLS ====="
+            for cmd in r2 rabin2 ldconfig python3 file strings 7z unzip tar xz gzip bzip2 binwalk; do
+              if command -v "${cmd}" >/dev/null 2>&1; then echo "${cmd}=$(command -v "${cmd}")"; else echo "${cmd}=NOT_FOUND"; fi
+            done
+            echo "===== RADARE2 ====="
+            if command -v r2 >/dev/null 2>&1; then r2 -v; fi
+            if command -v rabin2 >/dev/null 2>&1; then rabin2 -v; fi
+            echo "===== FILE TREE ====="
+            if [ -d "${ARTIFACT_ROOT}" ]; then find "${ARTIFACT_ROOT}" -maxdepth 12 -type f -printf '%p %s bytes\n' | sort; else echo "Artifact root missing"; fi
+          } > "${ARTIFACT_ROOT}/logs/final_diagnostics.log" 2>&1
+      - name: Upload Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel_offset_analysis
+          path: |
+            artifacts/**
+          if-no-files-found: warn
+          retention-days: 30
+          compression-level: 0
+          include-hidden-files: true
+      - name: Success Notice
+        if: success()
+        shell: bash
+        run: echo "::notice title=Kernel Offset Analysis Complete::Offsets computed successfully."
+      - name: Failure Notice
+        if: failure()
+        shell: bash
+        run: echo "::error title=Kernel Offset Analysis Failed::Workflow failed. Artifacts uploaded."; exit 1
