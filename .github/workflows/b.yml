@@ -1,14 +1,6 @@
 name: Kernel Offset Discovery
 
 on:
-  push:
-    branches:
-      - a 
-
-  pull_request:
-    branches:
-      - a
-
   workflow_dispatch:
     inputs:
       kernel_url:
@@ -336,30 +328,26 @@ jobs:
               arch=info.get("arch","")
               if arch:
                   return arch
-              # fallback: try to detect from binary
-              # if first bytes are ELF, we can read e_machine
-              return "arm64"  # default guess for QCOM
+              return "arm64"
 
           def find_offset_from_syscall(r2, syscall_names, arch):
               for name in syscall_names:
                   addr = find_symbol(r2, name)
                   if addr:
                       dis = get_function_disasm(r2, addr)
-                      # Write disassembly to log for debugging
+                      # Write disassembly for debugging
                       with open(LOG_ROOT / "disasm.log", "a") as f:
-                          f.write(f"===== {name} ====\n{dis}\n\n")
-                      # Parse for ARM64 pattern
+                          f.write(f"===== {name} (addr: {hex(addr)}) ====\n{dis}\n\n")
+                      # For ARM64: look for mrs x0, sp_el0 and then ldr with offset
                       if arch in ["arm", "aarch64", "arm64"]:
-                          # Look for mrs x0, sp_el0 followed by ldr w0, [x0, #offset]
-                          # The offset may be in hex or decimal
                           lines = dis.split('\n')
                           found_current = False
-                          for line in lines:
+                          for i, line in enumerate(lines):
                               if "mrs" in line and "sp_el0" in line and "x0" in line:
                                   found_current = True
                                   continue
-                              if found_current and "ldr" in line and "x0" in line and "#" in line:
-                                  # Find offset
+                              if found_current and ("ldr" in line or "add" in line) and "x0" in line and "#" in line:
+                                  # Try to extract offset
                                   m = re.search(r"\[x0,\s*#([0-9a-fA-Fx]+)\]", line)
                                   if m:
                                       val = m.group(1)
@@ -367,7 +355,24 @@ jobs:
                                           return int(val, 16)
                                       else:
                                           return int(val, 16)
-                          # Alternative: maybe the offset is loaded with movk or similar
+                                  # Also look for ldr x0, [x0, #offset] with w0
+                                  m = re.search(r"ldr\s+[wx][0-9]+,\s*\[x0,\s*#([0-9a-fA-Fx]+)\]", line)
+                                  if m:
+                                      val = m.group(1)
+                                      if val.startswith("0x"):
+                                          return int(val, 16)
+                                      else:
+                                          return int(val, 16)
+                          # If not found, try to find any ldr with x0 offset in the function
+                          for line in lines:
+                              if "ldr" in line and "x0" in line and "#" in line:
+                                  m = re.search(r"\[x0,\s*#([0-9a-fA-Fx]+)\]", line)
+                                  if m:
+                                      val = m.group(1)
+                                      if val.startswith("0x"):
+                                          return int(val, 16)
+                                      else:
+                                          return int(val, 16)
                       else:
                           # x86 pattern
                           lines = dis.split('\n')
@@ -475,6 +480,13 @@ jobs:
               exit(1)
           if not data.get("offsets"):
               print("WARNING: No offsets computed")
+              # Print a snippet of disasm.log if exists
+              disasm_log = os.environ["ARTIFACT_ROOT"]+"/logs/disasm.log"
+              if os.path.exists(disasm_log):
+                  with open(disasm_log, "r") as f:
+                      lines = f.readlines()
+                      print("First 20 lines of disasm.log:")
+                      print("".join(lines[:20]))
           PYEOF
       - name: Collect Diagnostics
         if: always()
