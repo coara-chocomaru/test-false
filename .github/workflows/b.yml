@@ -1,14 +1,6 @@
 name: Kernel Offset Discovery
 
 on:
-  push:
-    branches:
-      - a 
-
-  pull_request:
-    branches:
-      - a
-
   workflow_dispatch:
     inputs:
       kernel_url:
@@ -150,7 +142,7 @@ jobs:
               importlib.import_module(m)
               print("OK:", m)
           PYEOF
-      - name: Download and Prepare Kernel Image
+      - name: Download and Prepare Kernel Image (Split zImage & dtb)
         shell: bash
         run: |
           set -e
@@ -165,34 +157,63 @@ jobs:
           file "${ANALYSIS_ROOT}/input/kernel.download"
           sha256sum "${ANALYSIS_ROOT}/input/kernel.download" > "${ARTIFACT_ROOT}/logs/source_sha256.txt"
           md5sum "${ANALYSIS_ROOT}/input/kernel.download" > "${ARTIFACT_ROOT}/logs/source_md5.txt"
+
           mkdir -p "${ANALYSIS_ROOT}/input/extract"
-          # Determine if it's a zip archive
+          # If ZIP, extract and find the kernel file
           if file "${ANALYSIS_ROOT}/input/kernel.download" | grep -q "Zip archive"; then
             unzip -q "${ANALYSIS_ROOT}/input/kernel.download" -d "${ANALYSIS_ROOT}/input/extract"
-            # Find the largest file (likely the kernel image)
+            # Look for the largest file (likely the kernel-dtb.gz)
             KERNEL_FILE=$(find "${ANALYSIS_ROOT}/input/extract" -type f -size +1M | head -1)
-            if [ -z "${KERNEL_FILE}" ]; then
-              echo "No large file found in zip"
-              exit 1
-            fi
+            if [ -z "${KERNEL_FILE}" ]; then echo "No large file found in zip"; exit 1; fi
             mv "${KERNEL_FILE}" "${ANALYSIS_ROOT}/input/kernel_image_raw"
           else
             cp "${ANALYSIS_ROOT}/input/kernel.download" "${ANALYSIS_ROOT}/input/kernel_image_raw"
           fi
-          # Now kernel_image_raw might be gzip compressed (maybe with trailing DTB)
-          # Use gunzip; if it returns 2 (warning about trailing garbage) we still want the output
+
+          # Now kernel_image_raw may be gzip compressed (with appended DTB)
           if file "${ANALYSIS_ROOT}/input/kernel_image_raw" | grep -q "gzip compressed"; then
-            # gunzip may return 2 due to trailing garbage; we ignore the exit code
-            gunzip -c "${ANALYSIS_ROOT}/input/kernel_image_raw" > "${ANALYSIS_ROOT}/input/zImage" || true
+            # Decompress; gunzip will keep trailing garbage (the DTB) if we use -c
+            gunzip -c "${ANALYSIS_ROOT}/input/kernel_image_raw" > "${ANALYSIS_ROOT}/input/kernel_image_uncompressed" || true
           else
-            cp "${ANALYSIS_ROOT}/input/kernel_image_raw" "${ANALYSIS_ROOT}/input/zImage"
+            cp "${ANALYSIS_ROOT}/input/kernel_image_raw" "${ANALYSIS_ROOT}/input/kernel_image_uncompressed"
           fi
-          # Check that zImage is non-empty
+
+          # Split by DTB magic using Python
+          python3 - <<'SPLIT_PY'
+          import os, sys
+          infile = os.environ['ANALYSIS_ROOT'] + '/input/kernel_image_uncompressed'
+          out_zimage = os.environ['ANALYSIS_ROOT'] + '/input/zImage'
+          out_dtb = os.environ['ANALYSIS_ROOT'] + '/input/dtb'
+          with open(infile, 'rb') as f:
+              data = f.read()
+          magic = b'\xd0\x0d\xfe\xed'
+          idx = data.find(magic)
+          if idx != -1:
+              with open(out_zimage, 'wb') as f:
+                  f.write(data[:idx])
+              with open(out_dtb, 'wb') as f:
+                  f.write(data[idx:])
+              print(f"Split zImage and dtb at offset {idx}")
+          else:
+              # No DTB magic; assume entire file is zImage
+              with open(out_zimage, 'wb') as f:
+                  f.write(data)
+              print("No DTB magic found; using whole file as zImage")
+              # Create an empty dtb to satisfy expectations
+              with open(out_dtb, 'wb') as f:
+                  pass
+          SPLIT_PY
+
           if [ ! -s "${ANALYSIS_ROOT}/input/zImage" ]; then
-            echo "Failed to obtain zImage (empty or missing)"
+            echo "Failed to obtain zImage"
             exit 1
           fi
+          echo "zImage:"
           file "${ANALYSIS_ROOT}/input/zImage"
+          if [ -s "${ANALYSIS_ROOT}/input/dtb" ]; then
+            echo "dtb:"
+            file "${ANALYSIS_ROOT}/input/dtb"
+          fi
       - name: Create Kernel Analysis Script
         shell: bash
         run: |
@@ -211,6 +232,7 @@ jobs:
           ELF_MAGIC=b'\x7fELF'
           GZIP_MAGIC=b'\x1f\x8b'
           XZ_MAGIC=b'\xfd7zXZ\x00'
+
           def run_cmd(cmd,timeout=300):
               try:
                   r=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,errors="replace",timeout=timeout)
@@ -219,6 +241,7 @@ jobs:
                   return (124,(e.stdout if e.stdout else "")+"\nTIMEOUT\n")
               except Exception as e:
                   return (125,str(e))
+
           def sha256_file(p):
               h=hashlib.sha256()
               with open(p,"rb") as f:
@@ -227,21 +250,24 @@ jobs:
                       if not c: break
                       h.update(c)
               return h.hexdigest()
+
           def find_magic(data, magic):
               return data.find(magic)
+
           def decompress_gzip(data):
               try:
-                  import gzip
-                  import io
+                  import gzip, io
                   return gzip.decompress(data)
               except:
                   return None
+
           def decompress_xz(data):
               try:
                   import lzma
                   return lzma.decompress(data)
               except:
                   return None
+
           def extract_vmlinux_from_zimage(zimage_path):
               with open(zimage_path,"rb") as f:
                   data=f.read()
@@ -254,8 +280,7 @@ jobs:
                   if decomp and decomp.startswith(ELF_MAGIC):
                       out=EXTRACT_ROOT/"vmlinux_gzip"
                       out.parent.mkdir(parents=True,exist_ok=True)
-                      with open(out,"wb") as f:
-                          f.write(decomp)
+                      with open(out,"wb") as f: f.write(decomp)
                       return str(out)
               xz_off=data.find(XZ_MAGIC)
               if xz_off!=-1:
@@ -264,8 +289,7 @@ jobs:
                   if decomp and decomp.startswith(ELF_MAGIC):
                       out=EXTRACT_ROOT/"vmlinux_xz"
                       out.parent.mkdir(parents=True,exist_ok=True)
-                      with open(out,"wb") as f:
-                          f.write(decomp)
+                      with open(out,"wb") as f: f.write(decomp)
                       return str(out)
               outdir=EXTRACT_ROOT/"binwalk_extract"
               shutil.rmtree(outdir,ignore_errors=True)
@@ -283,22 +307,24 @@ jobs:
                   elf_data=data[offset:]
                   out=EXTRACT_ROOT/"vmlinux_direct"
                   out.parent.mkdir(parents=True,exist_ok=True)
-                  with open(out,"wb") as f:
-                      f.write(elf_data)
+                  with open(out,"wb") as f: f.write(elf_data)
                   return str(out)
               return None
+
           def r2_cmdj(r2,cmd):
               try:
                   v=r2.cmdj(cmd)
                   return v if v is not None else []
               except:
                   return []
+
           def find_symbol(r2,name):
               syms=r2_cmdj(r2,"isj")
               for s in syms:
                   if s.get("name","")==name:
                       return s.get("vaddr")
               return None
+
           def find_string_xref(r2,string):
               strings=r2_cmdj(r2,"izzj")
               addr=None
@@ -306,29 +332,56 @@ jobs:
                   if s.get("string","")==string:
                       addr=s.get("vaddr")
                       break
-              if addr is None:
-                  return None
+              if addr is None: return None
               xrefs=r2_cmdj(r2,"axtj "+hex(addr))
-              if not xrefs:
-                  return None
+              if not xrefs: return None
               for x in xrefs:
                   if x.get("type")=="CALL" or x.get("type")=="DATA":
                       return x.get("addr")
               return None
+
           def get_function_disasm(r2,addr):
               return r2.cmd("pdf @ "+hex(addr))
-          def find_offset_after_current(disasm,reg,pattern=None):
-              lines=disasm.split('\n')
-              found_gs=False
-              for line in lines:
-                  if pattern and pattern in line:
-                      found_gs=True
-                      continue
-                  if found_gs and "mov" in line and reg in line and "["+reg in line:
-                      m=re.search(r"\["+reg+r"\+0x([0-9a-fA-F]+)\]",line)
-                      if m:
-                          return int(m.group(1),16)
+
+          def detect_arch(r2):
+              info=r2_cmdj(r2,"ij")
+              arch=info.get("arch","")
+              return arch
+
+          def find_offset_from_syscall(r2, syscall_names, arch, reg):
+              for name in syscall_names:
+                  addr = find_symbol(r2, name)
+                  if addr:
+                      dis = get_function_disasm(r2, addr)
+                      # Parse disassembly to find offset
+                      # Look for pattern: mrs base, sp_el0 (ARM) or gs: (x86)
+                      # Then ldr with offset from that base
+                      lines = dis.split('\n')
+                      found_base = False
+                      for i, line in enumerate(lines):
+                          if arch in ["arm", "aarch64"]:
+                              if "mrs" in line and reg in line and "sp_el0" in line:
+                                  found_base = True
+                                  continue
+                              if found_base and "ldr" in line and reg in line and "#" in line:
+                                  m = re.search(r"\["+reg+r",\s*#([0-9a-fA-Fx]+)\]", line)
+                                  if m:
+                                      val = m.group(1)
+                                      if val.startswith("0x"):
+                                          return int(val, 16)
+                                      else:
+                                          return int(val, 16)
+                          else: # x86-64
+                              if "gs:" in line and "mov" in line and reg in line:
+                                  found_base = True
+                                  continue
+                              if found_base and "mov" in line and reg in line and "["+reg in line:
+                                  m = re.search(r"\["+reg+r"\+0x([0-9a-fA-F]+)\]", line)
+                                  if m:
+                                      return int(m.group(1), 16)
+                  # If not found, continue to next syscall name
               return None
+
           def analyze_vmlinux(vmlinux_path):
               r2=None
               try:
@@ -340,7 +393,8 @@ jobs:
                   r2.cmd("aac")
               except:
                   pass
-              result={}
+              arch=detect_arch(r2)
+              result={"arch":arch}
               init_nsproxy=find_symbol(r2,"init_nsproxy")
               if init_nsproxy is None:
                   init_nsproxy=find_string_xref(r2,"init_nsproxy")
@@ -349,35 +403,32 @@ jobs:
                   selinux_enforcing=find_string_xref(r2,"selinux_enforcing")
               result["init_nsproxy"]=init_nsproxy
               result["selinux_enforcing"]=selinux_enforcing
+
               offsets={}
-              syscall_map={
-                  "task_struct.pid": ["sys_getpid","__x64_sys_getpid","__se_sys_getpid","__arm64_sys_getpid"],
-                  "cred.uid": ["sys_getuid","__x64_sys_getuid","__se_sys_getuid","__arm64_sys_getuid"],
-                  "cred.gid": ["sys_getgid","__x64_sys_getgid","__se_sys_getgid","__arm64_sys_getgid"],
-                  "cred.euid": ["sys_geteuid","__x64_sys_geteuid","__se_sys_geteuid","__arm64_sys_geteuid"],
-                  "cred.egid": ["sys_getegid","__x64_sys_getegid","__se_sys_getegid","__arm64_sys_getegid"],
-                  "cred.fsuid": ["sys_getfsuid","__x64_sys_getfsuid","__se_sys_getfsuid","__arm64_sys_getfsuid"],
-                  "cred.fsgid": ["sys_getfsgid","__x64_sys_getfsgid","__se_sys_getfsgid","__arm64_sys_getfsgid"],
-                  "task_struct.nsproxy": ["sys_setns","__x64_sys_setns","__se_sys_setns","__arm64_sys_setns"],
-                  "task_struct.addr_limit": ["sys_prctl","__x64_sys_prctl","__se_sys_prctl","__arm64_sys_prctl"]
+              # For ARM64, the base register for current is often x0 after mrs x0, sp_el0
+              reg = "x0" if arch in ["arm", "aarch64"] else "rax"
+              syscall_map = {
+                  "task_struct.pid": ["sys_getpid", "__arm64_sys_getpid", "__se_sys_getpid", "__x64_sys_getpid"],
+                  "cred.uid": ["sys_getuid", "__arm64_sys_getuid", "__se_sys_getuid", "__x64_sys_getuid"],
+                  "cred.gid": ["sys_getgid", "__arm64_sys_getgid", "__se_sys_getgid", "__x64_sys_getgid"],
+                  "cred.euid": ["sys_geteuid", "__arm64_sys_geteuid", "__se_sys_geteuid", "__x64_sys_geteuid"],
+                  "cred.egid": ["sys_getegid", "__arm64_sys_getegid", "__se_sys_getegid", "__x64_sys_getegid"],
+                  "cred.fsuid": ["sys_getfsuid", "__arm64_sys_getfsuid", "__se_sys_getfsuid", "__x64_sys_getfsuid"],
+                  "cred.fsgid": ["sys_getfsgid", "__arm64_sys_getfsgid", "__se_sys_getfsgid", "__x64_sys_getfsgid"],
+                  "task_struct.nsproxy": ["sys_setns", "__arm64_sys_setns", "__se_sys_setns", "__x64_sys_setns"],
+                  "task_struct.addr_limit": ["sys_prctl", "__arm64_sys_prctl", "__se_sys_prctl", "__x64_sys_prctl"]
               }
               for key, names in syscall_map.items():
-                  for name in names:
-                      addr=find_symbol(r2,name)
-                      if addr:
-                          dis=get_function_disasm(r2,addr)
-                          off=find_offset_after_current(dis,"rax")
-                          if off is not None:
-                              offsets[key]=off
-                              break
-                      if key in offsets:
-                          break
+                  off = find_offset_from_syscall(r2, names, arch, reg)
+                  if off is not None:
+                      offsets[key] = off
               result["offsets"]=offsets
               try:
                   r2.quit()
               except:
                   pass
               return result
+
           def main():
               for d in [EXTRACT_ROOT,REPORT_ROOT,LOG_ROOT]:
                   d.mkdir(parents=True,exist_ok=True)
@@ -415,12 +466,15 @@ jobs:
           import json,os
           with open(os.environ["ARTIFACT_ROOT"]+"/reports/kernel_offsets.json") as f:
               data=json.load(f)
+          print("arch:",data.get("arch"))
           print("init_nsproxy:",data.get("init_nsproxy"))
           print("selinux_enforcing:",data.get("selinux_enforcing"))
           print("offsets:",data.get("offsets"))
           if "error" in data:
               print("ERROR:",data["error"])
               exit(1)
+          if not data.get("offsets"):
+              print("WARNING: No offsets computed")
           PYEOF
       - name: Collect Diagnostics
         if: always()
