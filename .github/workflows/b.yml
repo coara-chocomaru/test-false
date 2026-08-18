@@ -1,21 +1,13 @@
 name: Kernel Offset Discovery
 
 on:
-  push:
-    branches:
-      - a 
-
-  pull_request:
-    branches:
-      - a
-
   workflow_dispatch:
     inputs:
       kernel_url:
         description: URL to kernel image (zip or gz)
         required: true
         type: string
-        default: https://github.com/coara-chocomaru/test-false/raw/refs/heads/a/kernel-dtb.gz
+        default: https://github.com/coara-chocomaru/test-false/raw/refs/heads/a/kernel-dtb.zip
 
 jobs:
   analyze-kernel:
@@ -24,7 +16,7 @@ jobs:
       image: ubuntu:22.04
       options: --privileged
     env:
-      KERNEL_URL: ${{ github.event.inputs.kernel_url || 'https://github.com/coara-chocomaru/test-false/raw/refs/heads/a/kernel-dtb.gz' }}
+      KERNEL_URL: ${{ github.event.inputs.kernel_url || 'https://github.com/coara-chocomaru/test-false/raw/refs/heads/a/kernel-dtb.zip' }}
       PYTHONUNBUFFERED: "1"
       PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
       LD_LIBRARY_PATH: /usr/local/lib:/usr/lib:/lib
@@ -166,7 +158,7 @@ jobs:
           sha256sum "${ANALYSIS_ROOT}/input/kernel.download" > "${ARTIFACT_ROOT}/logs/source_sha256.txt"
           md5sum "${ANALYSIS_ROOT}/input/kernel.download" > "${ARTIFACT_ROOT}/logs/source_md5.txt"
           mkdir -p "${ANALYSIS_ROOT}/input/extract"
-          # If it's a zip, extract and find the kernel file
+          # Determine if it's a zip archive
           if file "${ANALYSIS_ROOT}/input/kernel.download" | grep -q "Zip archive"; then
             unzip -q "${ANALYSIS_ROOT}/input/kernel.download" -d "${ANALYSIS_ROOT}/input/extract"
             # Find the largest file (likely the kernel image)
@@ -179,15 +171,17 @@ jobs:
           else
             cp "${ANALYSIS_ROOT}/input/kernel.download" "${ANALYSIS_ROOT}/input/kernel_image_raw"
           fi
-          # Decompress if gzipped; gunzip will strip trailing DTB (which is fine)
+          # Now kernel_image_raw might be gzip compressed (maybe with trailing DTB)
+          # Use gunzip; if it returns 2 (warning about trailing garbage) we still want the output
           if file "${ANALYSIS_ROOT}/input/kernel_image_raw" | grep -q "gzip compressed"; then
-            gunzip -c "${ANALYSIS_ROOT}/input/kernel_image_raw" > "${ANALYSIS_ROOT}/input/zImage"
+            # gunzip may return 2 due to trailing garbage; we ignore the exit code
+            gunzip -c "${ANALYSIS_ROOT}/input/kernel_image_raw" > "${ANALYSIS_ROOT}/input/zImage" || true
           else
             cp "${ANALYSIS_ROOT}/input/kernel_image_raw" "${ANALYSIS_ROOT}/input/zImage"
           fi
-          # Ensure zImage exists and is non-empty
+          # Check that zImage is non-empty
           if [ ! -s "${ANALYSIS_ROOT}/input/zImage" ]; then
-            echo "Failed to obtain zImage"
+            echo "Failed to obtain zImage (empty or missing)"
             exit 1
           fi
           file "${ANALYSIS_ROOT}/input/zImage"
