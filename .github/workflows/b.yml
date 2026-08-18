@@ -1,6 +1,14 @@
 name: Kernel Offset Discovery
 
 on:
+  push:
+    branches:
+      - a 
+
+  pull_request:
+    branches:
+      - a
+
   workflow_dispatch:
     inputs:
       kernel_url:
