@@ -1,15 +1,6 @@
 name: Kernel Offset Discovery
 
 on:
-  push:
-    branches:
-      - a 
-
-  pull_request:
-    branches:
-      - a
-  
-
   workflow_dispatch:
     inputs:
       kernel_url:
@@ -166,28 +157,20 @@ jobs:
           file "${ANALYSIS_ROOT}/input/kernel.download"
           sha256sum "${ANALYSIS_ROOT}/input/kernel.download" > "${ARTIFACT_ROOT}/logs/source_sha256.txt"
           md5sum "${ANALYSIS_ROOT}/input/kernel.download" > "${ARTIFACT_ROOT}/logs/source_md5.txt"
-
           mkdir -p "${ANALYSIS_ROOT}/input/extract"
-          # If ZIP, extract and find the kernel file
           if file "${ANALYSIS_ROOT}/input/kernel.download" | grep -q "Zip archive"; then
             unzip -q "${ANALYSIS_ROOT}/input/kernel.download" -d "${ANALYSIS_ROOT}/input/extract"
-            # Look for the largest file (likely the kernel-dtb.gz)
             KERNEL_FILE=$(find "${ANALYSIS_ROOT}/input/extract" -type f -size +1M | head -1)
             if [ -z "${KERNEL_FILE}" ]; then echo "No large file found in zip"; exit 1; fi
             mv "${KERNEL_FILE}" "${ANALYSIS_ROOT}/input/kernel_image_raw"
           else
             cp "${ANALYSIS_ROOT}/input/kernel.download" "${ANALYSIS_ROOT}/input/kernel_image_raw"
           fi
-
-          # Now kernel_image_raw may be gzip compressed (with appended DTB)
           if file "${ANALYSIS_ROOT}/input/kernel_image_raw" | grep -q "gzip compressed"; then
-            # Decompress; gunzip will keep trailing garbage (the DTB) if we use -c
             gunzip -c "${ANALYSIS_ROOT}/input/kernel_image_raw" > "${ANALYSIS_ROOT}/input/kernel_image_uncompressed" || true
           else
             cp "${ANALYSIS_ROOT}/input/kernel_image_raw" "${ANALYSIS_ROOT}/input/kernel_image_uncompressed"
           fi
-
-          # Split by DTB magic using Python
           python3 - <<'SPLIT_PY'
           import os, sys
           infile = os.environ['ANALYSIS_ROOT'] + '/input/kernel_image_uncompressed'
@@ -204,25 +187,13 @@ jobs:
                   f.write(data[idx:])
               print(f"Split zImage and dtb at offset {idx}")
           else:
-              # No DTB magic; assume entire file is zImage
               with open(out_zimage, 'wb') as f:
                   f.write(data)
-              print("No DTB magic found; using whole file as zImage")
-              # Create an empty dtb to satisfy expectations
-              with open(out_dtb, 'wb') as f:
-                  pass
+              print("No DTB magic; using whole file as zImage")
+              open(out_dtb, 'wb').close()
           SPLIT_PY
-
-          if [ ! -s "${ANALYSIS_ROOT}/input/zImage" ]; then
-            echo "Failed to obtain zImage"
-            exit 1
-          fi
-          echo "zImage:"
+          if [ ! -s "${ANALYSIS_ROOT}/input/zImage" ]; then echo "Failed to obtain zImage"; exit 1; fi
           file "${ANALYSIS_ROOT}/input/zImage"
-          if [ -s "${ANALYSIS_ROOT}/input/dtb" ]; then
-            echo "dtb:"
-            file "${ANALYSIS_ROOT}/input/dtb"
-          fi
       - name: Create Kernel Analysis Script
         shell: bash
         run: |
@@ -355,40 +326,53 @@ jobs:
           def detect_arch(r2):
               info=r2_cmdj(r2,"ij")
               arch=info.get("arch","")
-              return arch
+              if arch:
+                  return arch
+              # fallback: try to detect from binary
+              # if first bytes are ELF, we can read e_machine
+              return "arm64"  # default guess for QCOM
 
-          def find_offset_from_syscall(r2, syscall_names, arch, reg):
+          def find_offset_from_syscall(r2, syscall_names, arch):
               for name in syscall_names:
                   addr = find_symbol(r2, name)
                   if addr:
                       dis = get_function_disasm(r2, addr)
-                      # Parse disassembly to find offset
-                      # Look for pattern: mrs base, sp_el0 (ARM) or gs: (x86)
-                      # Then ldr with offset from that base
-                      lines = dis.split('\n')
-                      found_base = False
-                      for i, line in enumerate(lines):
-                          if arch in ["arm", "aarch64"]:
-                              if "mrs" in line and reg in line and "sp_el0" in line:
-                                  found_base = True
+                      # Write disassembly to log for debugging
+                      with open(LOG_ROOT / "disasm.log", "a") as f:
+                          f.write(f"===== {name} ====\n{dis}\n\n")
+                      # Parse for ARM64 pattern
+                      if arch in ["arm", "aarch64", "arm64"]:
+                          # Look for mrs x0, sp_el0 followed by ldr w0, [x0, #offset]
+                          # The offset may be in hex or decimal
+                          lines = dis.split('\n')
+                          found_current = False
+                          for line in lines:
+                              if "mrs" in line and "sp_el0" in line and "x0" in line:
+                                  found_current = True
                                   continue
-                              if found_base and "ldr" in line and reg in line and "#" in line:
-                                  m = re.search(r"\["+reg+r",\s*#([0-9a-fA-Fx]+)\]", line)
+                              if found_current and "ldr" in line and "x0" in line and "#" in line:
+                                  # Find offset
+                                  m = re.search(r"\[x0,\s*#([0-9a-fA-Fx]+)\]", line)
                                   if m:
                                       val = m.group(1)
                                       if val.startswith("0x"):
                                           return int(val, 16)
                                       else:
                                           return int(val, 16)
-                          else: # x86-64
-                              if "gs:" in line and "mov" in line and reg in line:
-                                  found_base = True
+                          # Alternative: maybe the offset is loaded with movk or similar
+                      else:
+                          # x86 pattern
+                          lines = dis.split('\n')
+                          found_gs = False
+                          for line in lines:
+                              if "gs:" in line and "mov" in line and "rax" in line:
+                                  found_gs = True
                                   continue
-                              if found_base and "mov" in line and reg in line and "["+reg in line:
-                                  m = re.search(r"\["+reg+r"\+0x([0-9a-fA-F]+)\]", line)
+                              if found_gs and "mov" in line and "rax" in line and "[" in line:
+                                  m = re.search(r"\[rax\+0x([0-9a-fA-F]+)\]", line)
                                   if m:
                                       return int(m.group(1), 16)
-                  # If not found, continue to next syscall name
+                  # If not found, try next syscall name
               return None
 
           def analyze_vmlinux(vmlinux_path):
@@ -414,21 +398,19 @@ jobs:
               result["selinux_enforcing"]=selinux_enforcing
 
               offsets={}
-              # For ARM64, the base register for current is often x0 after mrs x0, sp_el0
-              reg = "x0" if arch in ["arm", "aarch64"] else "rax"
               syscall_map = {
-                  "task_struct.pid": ["sys_getpid", "__arm64_sys_getpid", "__se_sys_getpid", "__x64_sys_getpid"],
-                  "cred.uid": ["sys_getuid", "__arm64_sys_getuid", "__se_sys_getuid", "__x64_sys_getuid"],
-                  "cred.gid": ["sys_getgid", "__arm64_sys_getgid", "__se_sys_getgid", "__x64_sys_getgid"],
-                  "cred.euid": ["sys_geteuid", "__arm64_sys_geteuid", "__se_sys_geteuid", "__x64_sys_geteuid"],
-                  "cred.egid": ["sys_getegid", "__arm64_sys_getegid", "__se_sys_getegid", "__x64_sys_getegid"],
-                  "cred.fsuid": ["sys_getfsuid", "__arm64_sys_getfsuid", "__se_sys_getfsuid", "__x64_sys_getfsuid"],
-                  "cred.fsgid": ["sys_getfsgid", "__arm64_sys_getfsgid", "__se_sys_getfsgid", "__x64_sys_getfsgid"],
-                  "task_struct.nsproxy": ["sys_setns", "__arm64_sys_setns", "__se_sys_setns", "__x64_sys_setns"],
-                  "task_struct.addr_limit": ["sys_prctl", "__arm64_sys_prctl", "__se_sys_prctl", "__x64_sys_prctl"]
+                  "task_struct.pid": ["__arm64_sys_getpid", "__se_sys_getpid", "sys_getpid"],
+                  "cred.uid": ["__arm64_sys_getuid", "__se_sys_getuid", "sys_getuid"],
+                  "cred.gid": ["__arm64_sys_getgid", "__se_sys_getgid", "sys_getgid"],
+                  "cred.euid": ["__arm64_sys_geteuid", "__se_sys_geteuid", "sys_geteuid"],
+                  "cred.egid": ["__arm64_sys_getegid", "__se_sys_getegid", "sys_getegid"],
+                  "cred.fsuid": ["__arm64_sys_getfsuid", "__se_sys_getfsuid", "sys_getfsuid"],
+                  "cred.fsgid": ["__arm64_sys_getfsgid", "__se_sys_getfsgid", "sys_getfsgid"],
+                  "task_struct.nsproxy": ["__arm64_sys_setns", "__se_sys_setns", "sys_setns"],
+                  "task_struct.addr_limit": ["__arm64_sys_prctl", "__se_sys_prctl", "sys_prctl"]
               }
               for key, names in syscall_map.items():
-                  off = find_offset_from_syscall(r2, names, arch, reg)
+                  off = find_offset_from_syscall(r2, names, arch)
                   if off is not None:
                       offsets[key] = off
               result["offsets"]=offsets
@@ -439,6 +421,7 @@ jobs:
               return result
 
           def main():
+              LOG_ROOT.mkdir(parents=True,exist_ok=True)
               for d in [EXTRACT_ROOT,REPORT_ROOT,LOG_ROOT]:
                   d.mkdir(parents=True,exist_ok=True)
               if not ZIMAGE.is_file() or ZIMAGE.stat().st_size==0:
