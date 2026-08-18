@@ -1,14 +1,6 @@
 name: Kernel Offset Discovery
 
 on:
-  push:
-    branches:
-      - a 
-
-  pull_request:
-    branches:
-      - a
-
   workflow_dispatch:
     inputs:
       kernel_url:
@@ -165,11 +157,11 @@ jobs:
           file "${ANALYSIS_ROOT}/input/kernel.download"
           sha256sum "${ANALYSIS_ROOT}/input/kernel.download" > "${ARTIFACT_ROOT}/logs/source_sha256.txt"
           md5sum "${ANALYSIS_ROOT}/input/kernel.download" > "${ARTIFACT_ROOT}/logs/source_md5.txt"
-          # If it's a zip, extract and find the kernel file
           mkdir -p "${ANALYSIS_ROOT}/input/extract"
+          # If it's a zip, extract and find the kernel file
           if file "${ANALYSIS_ROOT}/input/kernel.download" | grep -q "Zip archive"; then
             unzip -q "${ANALYSIS_ROOT}/input/kernel.download" -d "${ANALYSIS_ROOT}/input/extract"
-            # Find the largest file or likely kernel image (e.g., contains kernel-dtb.gz)
+            # Find the largest file (likely the kernel image)
             KERNEL_FILE=$(find "${ANALYSIS_ROOT}/input/extract" -type f -size +1M | head -1)
             if [ -z "${KERNEL_FILE}" ]; then
               echo "No large file found in zip"
@@ -179,35 +171,13 @@ jobs:
           else
             cp "${ANALYSIS_ROOT}/input/kernel.download" "${ANALYSIS_ROOT}/input/kernel_image_raw"
           fi
-          # Decompress if gzipped
+          # Decompress if gzipped; gunzip will strip trailing DTB (which is fine)
           if file "${ANALYSIS_ROOT}/input/kernel_image_raw" | grep -q "gzip compressed"; then
-            gunzip -c "${ANALYSIS_ROOT}/input/kernel_image_raw" > "${ANALYSIS_ROOT}/input/kernel_image_uncompressed"
+            gunzip -c "${ANALYSIS_ROOT}/input/kernel_image_raw" > "${ANALYSIS_ROOT}/input/zImage"
           else
-            cp "${ANALYSIS_ROOT}/input/kernel_image_raw" "${ANALYSIS_ROOT}/input/kernel_image_uncompressed"
+            cp "${ANALYSIS_ROOT}/input/kernel_image_raw" "${ANALYSIS_ROOT}/input/zImage"
           fi
-          # Split by DTB magic using Python (reliable)
-          python3 - <<'SPLIT_SCRIPT'
-          import os, sys
-          infile = os.environ['ANALYSIS_ROOT'] + '/input/kernel_image_uncompressed'
-          out_zimage = os.environ['ANALYSIS_ROOT'] + '/input/zImage'
-          out_dtb = os.environ['ANALYSIS_ROOT'] + '/input/dtb'
-          with open(infile, 'rb') as f:
-              data = f.read()
-          magic = b'\xd0\x0d\xfe\xed'
-          idx = data.find(magic)
-          if idx != -1:
-              with open(out_zimage, 'wb') as f:
-                  f.write(data[:idx])
-              with open(out_dtb, 'wb') as f:
-                  f.write(data[idx:])
-              print(f"Split zImage and dtb at offset {idx}")
-          else:
-              # No DTB magic, assume whole file is zImage
-              with open(out_zimage, 'wb') as f:
-                  f.write(data)
-              print("No DTB magic found; using whole file as zImage")
-          SPLIT_SCRIPT
-          # Ensure zImage exists
+          # Ensure zImage exists and is non-empty
           if [ ! -s "${ANALYSIS_ROOT}/input/zImage" ]; then
             echo "Failed to obtain zImage"
             exit 1
