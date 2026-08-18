@@ -1,14 +1,6 @@
 name: Kernel Offset Discovery
 
 on:
-  push:
-    branches:
-      - a 
-
-  pull_request:
-    branches:
-      - a
-
   workflow_dispatch:
     inputs:
       kernel_url:
@@ -165,25 +157,48 @@ jobs:
           file "${ANALYSIS_ROOT}/input/kernel.download"
           sha256sum "${ANALYSIS_ROOT}/input/kernel.download" > "${ARTIFACT_ROOT}/logs/source_sha256.txt"
           md5sum "${ANALYSIS_ROOT}/input/kernel.download" > "${ARTIFACT_ROOT}/logs/source_md5.txt"
-          # Determine if it's zip or gzip or raw
+          # Prepare extraction
           mkdir -p "${ANALYSIS_ROOT}/input/extract"
+          # If it's a zip, unzip and find the contained kernel file
           if file "${ANALYSIS_ROOT}/input/kernel.download" | grep -q "Zip archive"; then
             unzip -q "${ANALYSIS_ROOT}/input/kernel.download" -d "${ANALYSIS_ROOT}/input/extract"
-            # look for kernel image file, assume it's the largest or named zImage
-            KERNEL_FILE=$(find "${ANALYSIS_ROOT}/input/extract" -type f -exec file {} \; | grep -E 'gzip compressed|ELF|Linux kernel' | head -1 | cut -d: -f1)
+            # Find a likely kernel file (largest, or named kernel-dtb.gz, etc.)
+            KERNEL_FILE=$(find "${ANALYSIS_ROOT}/input/extract" -type f -size +1M | head -1)
             if [ -z "${KERNEL_FILE}" ]; then
-              KERNEL_FILE=$(find "${ANALYSIS_ROOT}/input/extract" -type f -size +1M | head -1)
+              echo "No large file found in zip"
+              exit 1
             fi
-            if [ -z "${KERNEL_FILE}" ]; then echo "No kernel file found in zip"; exit 1; fi
-            mv "${KERNEL_FILE}" "${ANALYSIS_ROOT}/input/kernel_image"
-          elif file "${ANALYSIS_ROOT}/input/kernel.download" | grep -q "gzip compressed"; then
-            gunzip -c "${ANALYSIS_ROOT}/input/kernel.download" > "${ANALYSIS_ROOT}/input/kernel_image"
+            mv "${KERNEL_FILE}" "${ANALYSIS_ROOT}/input/kernel_image_raw"
           else
-            # assume raw kernel image
-            cp "${ANALYSIS_ROOT}/input/kernel.download" "${ANALYSIS_ROOT}/input/kernel_image"
+            cp "${ANALYSIS_ROOT}/input/kernel.download" "${ANALYSIS_ROOT}/input/kernel_image_raw"
           fi
-          if [ ! -s "${ANALYSIS_ROOT}/input/kernel_image" ]; then echo "Failed to obtain kernel image"; exit 1; fi
-          file "${ANALYSIS_ROOT}/input/kernel_image"
+          # Now kernel_image_raw might be a gzip (or xz) compressed kernel+dtb, or just a kernel image
+          # Try to gunzip if it's gzip
+          if file "${ANALYSIS_ROOT}/input/kernel_image_raw" | grep -q "gzip compressed"; then
+            gunzip -c "${ANALYSIS_ROOT}/input/kernel_image_raw" > "${ANALYSIS_ROOT}/input/kernel_image_uncompressed"
+          else
+            cp "${ANALYSIS_ROOT}/input/kernel_image_raw" "${ANALYSIS_ROOT}/input/kernel_image_uncompressed"
+          fi
+          # Now split by DTB magic if present
+          DTB_MAGIC="D0 0D FE ED"
+          if strings -t x "${ANALYSIS_ROOT}/input/kernel_image_uncompressed" | grep -qi "D0 0D FE ED"; then
+            # Find offset of DTB magic
+            OFFSET=$(od -An -v -tx1 "${ANALYSIS_ROOT}/input/kernel_image_uncompressed" | tr -d '\n' | grep -bo "$(echo -n "$DTB_MAGIC" | xxd -r -p)" | head -1 | cut -d: -f1)
+            if [ -n "${OFFSET}" ]; then
+              dd if="${ANALYSIS_ROOT}/input/kernel_image_uncompressed" of="${ANALYSIS_ROOT}/input/zImage" bs=1 count="${OFFSET}" 2>/dev/null
+              dd if="${ANALYSIS_ROOT}/input/kernel_image_uncompressed" of="${ANALYSIS_ROOT}/input/dtb" bs=1 skip="${OFFSET}" 2>/dev/null
+              echo "Split zImage and dtb at offset ${OFFSET}"
+            fi
+          else
+            # No DTB magic, assume the whole file is the kernel
+            cp "${ANALYSIS_ROOT}/input/kernel_image_uncompressed" "${ANALYSIS_ROOT}/input/zImage"
+          fi
+          # Ensure we have a zImage file
+          if [ ! -s "${ANALYSIS_ROOT}/input/zImage" ]; then
+            echo "Failed to obtain zImage"
+            exit 1
+          fi
+          file "${ANALYSIS_ROOT}/input/zImage"
       - name: Create Kernel Analysis Script
         shell: bash
         run: |
@@ -194,13 +209,14 @@ jobs:
           import r2pipe
           ANALYSIS_ROOT=Path(os.environ["ANALYSIS_ROOT"])
           ARTIFACT_ROOT=Path(os.environ["ARTIFACT_ROOT"])
-          KERNEL_IMAGE=ANALYSIS_ROOT/"input/kernel_image"
-          FILES_ROOT=ANALYSIS_ROOT/"files"
+          ZIMAGE=ANALYSIS_ROOT/"input/zImage"
           EXTRACT_ROOT=ANALYSIS_ROOT/"extracted"
           REPORT_ROOT=ARTIFACT_ROOT/"reports"
           LOG_ROOT=ARTIFACT_ROOT/"logs"
           READ_CHUNK=1024*1024
           ELF_MAGIC=b'\x7fELF'
+          GZIP_MAGIC=b'\x1f\x8b'
+          XZ_MAGIC=b'\xfd7zXZ\x00'
           def run_cmd(cmd,timeout=300):
               try:
                   r=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,errors="replace",timeout=timeout)
@@ -217,17 +233,55 @@ jobs:
                       if not c: break
                       h.update(c)
               return h.hexdigest()
-          def find_elf_offset(data):
-              return data.find(ELF_MAGIC)
-          def extract_vmlinux_from_image(image_path):
-              # Try multiple extraction strategies
-              strategies=[]
-              # 1. binwalk -Me
+          def find_magic(data, magic):
+              return data.find(magic)
+          def decompress_gzip(data):
+              try:
+                  import gzip
+                  import io
+                  return gzip.decompress(data)
+              except:
+                  return None
+          def decompress_xz(data):
+              try:
+                  import lzma
+                  return lzma.decompress(data)
+              except:
+                  return None
+          def extract_vmlinux_from_zimage(zimage_path):
+              # Read the whole file
+              with open(zimage_path,"rb") as f:
+                  data=f.read()
+              # 1. Check if it's already ELF
+              if data.startswith(ELF_MAGIC):
+                  return str(zimage_path)
+              # 2. Try to find gzip magic and decompress
+              gzip_off=data.find(GZIP_MAGIC)
+              if gzip_off!=-1:
+                  gzip_data=data[gzip_off:]
+                  decomp=decompress_gzip(gzip_data)
+                  if decomp and decomp.startswith(ELF_MAGIC):
+                      out=EXTRACT_ROOT/"vmlinux_gzip"
+                      out.parent.mkdir(parents=True,exist_ok=True)
+                      with open(out,"wb") as f:
+                          f.write(decomp)
+                      return str(out)
+              # 3. Try xz
+              xz_off=data.find(XZ_MAGIC)
+              if xz_off!=-1:
+                  xz_data=data[xz_off:]
+                  decomp=decompress_xz(xz_data)
+                  if decomp and decomp.startswith(ELF_MAGIC):
+                      out=EXTRACT_ROOT/"vmlinux_xz"
+                      out.parent.mkdir(parents=True,exist_ok=True)
+                      with open(out,"wb") as f:
+                          f.write(decomp)
+                      return str(out)
+              # 4. Try binwalk
               outdir=EXTRACT_ROOT/"binwalk_extract"
               shutil.rmtree(outdir,ignore_errors=True)
               outdir.mkdir(parents=True,exist_ok=True)
-              code,out=run_cmd(["binwalk","-Me","--run-as=root","--directory="+str(outdir),str(image_path)],1800)
-              # Search for ELF in extracted
+              code,out=run_cmd(["binwalk","-Me","--run-as=root","--directory="+str(outdir),str(zimage_path)],1800)
               for root,_,files in os.walk(outdir):
                   for f in files:
                       p=os.path.join(root,f)
@@ -235,45 +289,15 @@ jobs:
                           with open(p,"rb") as fd:
                               if fd.read(4)==ELF_MAGIC:
                                   return p
-              # 2. direct scan for ELF magic and dd extract
-              with open(image_path,"rb") as f:
-                  data=f.read()
-              offset=find_elf_offset(data)
+              # 5. Search entire file for ELF magic and extract from there
+              offset=find_magic(data, ELF_MAGIC)
               if offset!=-1:
                   elf_data=data[offset:]
-                  elf_path=EXTRACT_ROOT/"vmlinux_direct_elf"
-                  with open(elf_path,"wb") as f:
+                  out=EXTRACT_ROOT/"vmlinux_direct"
+                  out.parent.mkdir(parents=True,exist_ok=True)
+                  with open(out,"wb") as f:
                       f.write(elf_data)
-                  if elf_data[:4]==ELF_MAGIC:
-                      return str(elf_path)
-              # 3. try to decompress if it's gzip
-              try:
-                  import gzip
-                  with gzip.open(image_path,"rb") as f:
-                      decompressed=f.read()
-                  offset=find_elf_offset(decompressed)
-                  if offset!=-1:
-                      elf_data=decompressed[offset:]
-                      elf_path=EXTRACT_ROOT/"vmlinux_gzip_decompressed"
-                      with open(elf_path,"wb") as f:
-                          f.write(elf_data)
-                      return str(elf_path)
-              except:
-                  pass
-              # 4. try xz
-              try:
-                  import lzma
-                  with lzma.open(image_path,"rb") as f:
-                      decompressed=f.read()
-                  offset=find_elf_offset(decompressed)
-                  if offset!=-1:
-                      elf_data=decompressed[offset:]
-                      elf_path=EXTRACT_ROOT/"vmlinux_xz_decompressed"
-                      with open(elf_path,"wb") as f:
-                          f.write(elf_data)
-                      return str(elf_path)
-              except:
-                  pass
+                  return str(out)
               return None
           def r2_cmdj(r2,cmd):
               try:
@@ -338,9 +362,6 @@ jobs:
               result["init_nsproxy"]=init_nsproxy
               result["selinux_enforcing"]=selinux_enforcing
               offsets={}
-              # For x86-64: use gs: prefix, for ARM: use different patterns, but we attempt generic
-              # We'll try to find the offset by looking at syscall functions and the instruction that reads from a pointer
-              # The syscall functions:
               syscall_map={
                   "task_struct.pid": ["sys_getpid","__x64_sys_getpid","__se_sys_getpid","__arm64_sys_getpid"],
                   "cred.uid": ["sys_getuid","__x64_sys_getuid","__se_sys_getuid","__arm64_sys_getuid"],
@@ -352,24 +373,17 @@ jobs:
                   "task_struct.nsproxy": ["sys_setns","__x64_sys_setns","__se_sys_setns","__arm64_sys_setns"],
                   "task_struct.addr_limit": ["sys_prctl","__x64_sys_prctl","__se_sys_prctl","__arm64_sys_prctl"]
               }
-              # We will try to find the offset by searching for a pattern: after a gs/fs reference, there is a mov with offset
               for key, names in syscall_map.items():
                   for name in names:
                       addr=find_symbol(r2,name)
                       if addr:
                           dis=get_function_disasm(r2,addr)
-                          # try to find offset after a reference to gs: or similar
                           off=find_offset_after_current(dis,"rax")
                           if off is not None:
                               offsets[key]=off
                               break
                       if key in offsets:
                           break
-              # If some offsets missing, try alternative patterns
-              if "task_struct.pid" not in offsets:
-                  # try to find by scanning for mov with offset after gs:
-                  # We'll just get all functions and scan
-                  pass
               result["offsets"]=offsets
               try:
                   r2.quit()
@@ -377,12 +391,12 @@ jobs:
                   pass
               return result
           def main():
-              for d in [FILES_ROOT,EXTRACT_ROOT,REPORT_ROOT,LOG_ROOT]:
+              for d in [EXTRACT_ROOT,REPORT_ROOT,LOG_ROOT]:
                   d.mkdir(parents=True,exist_ok=True)
-              if not KERNEL_IMAGE.is_file() or KERNEL_IMAGE.stat().st_size==0:
-                  print("Kernel image missing or empty"); return 1
-              print("Kernel image:",KERNEL_IMAGE)
-              vmlinux=extract_vmlinux_from_image(str(KERNEL_IMAGE))
+              if not ZIMAGE.is_file() or ZIMAGE.stat().st_size==0:
+                  print("zImage missing or empty"); return 1
+              print("zImage:",ZIMAGE)
+              vmlinux=extract_vmlinux_from_zimage(str(ZIMAGE))
               if vmlinux is None:
                   print("vmlinux extraction failed")
                   return 3
