@@ -14,7 +14,7 @@ on:
         description: URL to kernel-dtb.gz
         required: true
         type: string
-        default: https://github.com/coara-chocomaru/test-false/raw/refs/heads/a/armeabi-v7a2.zip
+        default: https://github.com/coara-chocomaru/test-false/raw/refs/heads/a/kernel-dtb.gz
 
 jobs:
   analyze-kernel:
