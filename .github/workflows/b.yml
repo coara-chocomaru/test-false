@@ -15,7 +15,7 @@ on:
         description: URL to kernel image (zip or gz)
         required: true
         type: string
-        default: https://github.com/coara-chocomaru/test-false/raw/refs/heads/a/kernel-dtb.zip
+        default: https://github.com/coara-chocomaru/test-false/raw/refs/heads/a/kernel-dtb.gz
 
 jobs:
   analyze-kernel:
@@ -24,7 +24,7 @@ jobs:
       image: ubuntu:22.04
       options: --privileged
     env:
-      KERNEL_URL: ${{ github.event.inputs.kernel_url || 'https://github.com/coara-chocomaru/test-false/raw/refs/heads/a/kernel-dtb.zip' }}
+      KERNEL_URL: ${{ github.event.inputs.kernel_url || 'https://github.com/coara-chocomaru/test-false/raw/refs/heads/a/kernel-dtb.gz' }}
       PYTHONUNBUFFERED: "1"
       PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
       LD_LIBRARY_PATH: /usr/local/lib:/usr/lib:/lib
