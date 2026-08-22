@@ -1,0 +1,84 @@
+name: Build Reverse Shell for Windows
+
+on:
+  push:
+    branches: [ "main2", "master" ]
+  pull_request:
+    branches: [ "main2", "master" ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: MSVC / ${{ matrix.arch }}
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        arch: [x64, x86]
+      fail-fast: false
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Configure MSVC environment (${{ matrix.arch }})
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.arch }}
+
+      - name: Compile reverse shell
+        shell: cmd
+        run: |
+          cl.exe /nologo ^
+            /utf-8 ^
+            /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN /DNOMINMAX ^
+            /EHsc /std:c++17 /permissive- ^
+            /O2 /Ob2 /Oi /GL /Gw /Gy /GF /GR- /MT /GS /W3 /MP ^
+            reverse_shell_win.cpp ^
+            /link /LTCG /OPT:REF /OPT:ICF /INCREMENTAL:NO /SUBSYSTEM:CONSOLE ^
+            ws2_32.lib ^
+            /OUT:reverse_shell_${{ matrix.arch }}.exe
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: reverse-shell-${{ matrix.arch }}
+          path: reverse_shell_${{ matrix.arch }}.exe
+          if-no-files-found: error
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+
+    steps:
+      - name: Download x64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: reverse-shell-x64
+          path: dist/x64
+
+      - name: Download x86 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: reverse-shell-x86
+          path: dist/x86
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Build ${{ github.run_number }}
+          generate_release_notes: true
+          files: |
+            dist/x64/reverse_shell_x64.exe
+            dist/x86/reverse_shell_x86.exe
