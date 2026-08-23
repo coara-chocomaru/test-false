@@ -11,7 +11,7 @@
 
 #pragma comment(lib, "ws2_32.lib")
 
-#define PORT 9981
+#define PORT 1234
 #define BUFFER_SIZE 4096
 #define BACKLOG 5
 
