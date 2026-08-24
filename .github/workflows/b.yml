@@ -1,6 +1,14 @@
 name: Extract OTA Images (Android 9)
 
 on:
+  push:
+    branches:
+      - a 
+
+  pull_request:
+    branches:
+      - a
+      
   workflow_dispatch:
     inputs:
       ota_url:
