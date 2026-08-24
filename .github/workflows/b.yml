@@ -13,10 +13,10 @@ on:
   workflow_dispatch:
     inputs:
       ota_url:
-        description: 'http://d15ze2y2hx4s9h.cloudfront.net/platforms/v2/szj_js202/com.justsystems.smilehs.platform/stable/SZJ-JS202_1.000JS.0072.a_user_to_1.032JS.0090.a_user'
+        description: 'https://github.com/coara-chocomaru/test-false/releases/download/a/SZJ-JS202_1.000JS.0072.a_user_to_1.032JS.0090.a_user.zip'
         required: true
         type: string
-        default: 'http://d15ze2y2hx4s9h.cloudfront.net/platforms/v2/szj_js202/com.justsystems.smilehs.platform/stable/SZJ-JS202_1.000JS.0072.a_user_to_1.032JS.0090.a_user.zip'
+        default: 'https://github.com/coara-chocomaru/test-false/releases/download/a/SZJ-JS202_1.000JS.0072.a_user_to_1.032JS.0090.a_user.zip'
 
 env:
   WORK_DIR: 'ota_work'
