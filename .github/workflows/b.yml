@@ -1,535 +1,108 @@
-name: Kernel Offset Discovery
+name: Extract OTA Images (Android 9)
 
 on:
   workflow_dispatch:
     inputs:
-      kernel_url:
-        description: URL to kernel image (zip or gz)
+      ota_url:
+        description: 'OTA 包的下载链接（支持 .zip 或 .bin）'
         required: true
         type: string
-        default: https://github.com/coara-chocomaru/test-false/raw/refs/heads/a/wigig_wiburn.zip
+        default: 'https://example.com/ota_update.zip'
+
+env:
+  WORK_DIR: 'ota_work'
+  OUTPUT_DIR: 'extracted_images'
 
 jobs:
-  analyze-kernel:
-    runs-on: ubuntu-latest
-    container:
-      image: ubuntu:22.04
-      options: --privileged
-    env:
-      KERNEL_URL: ${{ github.event.inputs.kernel_url || 'https://github.com/coara-chocomaru/test-false/raw/refs/heads/a/wigig_wiburn.zip' }}
-      PYTHONUNBUFFERED: "1"
-      PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-      LD_LIBRARY_PATH: /usr/local/lib:/usr/lib:/lib
+  extract:
+    runs-on: ubuntu-22.04  # 使用当前受支持的 Ubuntu LTS 版本
     steps:
-      - name: Install Base Packages
-        shell: bash
+      - name: 安装依赖工具
         run: |
-          set -e
-          export DEBIAN_FRONTEND=noninteractive
-          apt-get update -y
-          apt-get install -y --no-install-recommends ca-certificates curl wget git libc-bin libgcc-s1 libstdc++6
-          apt-get clean
-          rm -rf /var/lib/apt/lists/*
-          if ! command -v git >/dev/null 2>&1; then echo "git not found"; exit 1; fi
-          if ! command -v curl >/dev/null 2>&1; then echo "curl not found"; exit 1; fi
-          ldconfig --version
-      - name: Determine Container Workspace
-        shell: bash
+          sudo apt-get update
+          sudo apt-get install -y \
+            wget \
+            unzip \
+            python3 \
+            android-sdk-libsparse-utils \
+            bsdiff \
+            git \
+            file
+          # 克隆 imgpatchtools（用于应用差分补丁）
+          git clone https://github.com/erfanoabdi/imgpatchtools.git /tmp/imgpatchtools
+          chmod +x /tmp/imgpatchtools/*.py
+
+      - name: 创建工作目录
         run: |
-          set -e
-          WORKSPACE_ROOT="$(pwd)"
-          if [ ! -d "${WORKSPACE_ROOT}" ]; then echo "Workspace does not exist: ${WORKSPACE_ROOT}"; exit 1; fi
-          echo "WORKSPACE_ROOT=${WORKSPACE_ROOT}" >> "${GITHUB_ENV}"
-          echo "ANALYSIS_ROOT=${WORKSPACE_ROOT}/analysis" >> "${GITHUB_ENV}"
-          echo "ARTIFACT_ROOT=${WORKSPACE_ROOT}/artifacts" >> "${GITHUB_ENV}"
-          echo "Detected container workspace: ${WORKSPACE_ROOT}"
-      - name: Initialize Directories
-        shell: bash
+          mkdir -p ${{ env.WORK_DIR }} ${{ env.OUTPUT_DIR }}
+
+      - name: 下载 OTA 包
         run: |
-          set -e
-          mkdir -p "${ANALYSIS_ROOT}/input" "${ANALYSIS_ROOT}/files" "${ANALYSIS_ROOT}/extracted" "${ANALYSIS_ROOT}/work" \
-                   "${ARTIFACT_ROOT}/logs" "${ARTIFACT_ROOT}/reports" "${ARTIFACT_ROOT}/reports/files" \
-                   "${ARTIFACT_ROOT}/reports/disassembly" "${ARTIFACT_ROOT}/raw"
-          test -d "${ANALYSIS_ROOT}"
-          test -d "${ARTIFACT_ROOT}"
-          {
-            echo "workflow_started=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-            echo "github_run_id=${GITHUB_RUN_ID}"
-            echo "github_repository=${GITHUB_REPOSITORY}"
-            echo "github_ref=${GITHUB_REF}"
-            echo "workspace_root=${WORKSPACE_ROOT}"
-            echo "analysis_root=${ANALYSIS_ROOT}"
-            echo "artifact_root=${ARTIFACT_ROOT}"
-            echo "kernel_url=${KERNEL_URL}"
-          } > "${ARTIFACT_ROOT}/logs/workflow_status.txt"
-          echo "Workspace: $(pwd)"
-      - name: Install Analysis Packages
-        shell: bash
+          wget --no-check-certificate -O ${{ env.WORK_DIR }}/ota.zip "${{ github.event.inputs.ota_url }}"
+        continue-on-error: true   # 即使下载失败也继续（后续会处理）
+
+      - name: 解压 OTA 包
         run: |
-          set -e
-          export DEBIAN_FRONTEND=noninteractive
-          apt-get update -y
-          apt-get install -y --no-install-recommends unzip zip tar gzip bzip2 xz-utils zstd lz4 p7zip-full p7zip-rar \
-            file binutils build-essential gcc g++ make cmake pkg-config autoconf automake libtool attr python3 python3-pip \
-            python3-dev python3-setuptools python3-wheel python3-venv default-jdk-headless binwalk liblzma-dev libmagic1 \
-            gdb-multiarch qemu-user-static bsdmainutils bsdextrautils libc-bin
-          apt-get clean
-          rm -rf /var/lib/apt/lists/*
-          for cmd in python3 pip3 gcc g++ make cmake file strings 7z unzip tar xz gzip bzip2 binwalk ldconfig; do
-            if ! command -v "${cmd}" >/dev/null 2>&1; then echo "Missing: ${cmd}"; exit 1; fi
+          unzip -o ${{ env.WORK_DIR }}/ota.zip -d ${{ env.WORK_DIR }}/ota_extracted/ || echo "解压部分文件失败，继续..."
+        continue-on-error: true
+
+      - name: 查找差分补丁文件
+        id: find_patches
+        run: |
+          find ${{ env.WORK_DIR }}/ota_extracted -type f \( -name "*system*.patch" -o -name "*vendor*.patch" -o -name "*.patch.dat" \) > /tmp/patch_list.txt || true
+          cat /tmp/patch_list.txt || echo "未找到补丁文件"
+        continue-on-error: true
+
+      - name: 提取已存在的完整镜像
+        run: |
+          find ${{ env.WORK_DIR }}/ota_extracted -type f -name "system.img" -exec cp {} ${{ env.OUTPUT_DIR }}/ \; || echo "未找到 system.img"
+          find ${{ env.WORK_DIR }}/ota_extracted -type f -name "vendor.img" -exec cp {} ${{ env.OUTPUT_DIR }}/ \; || echo "未找到 vendor.img"
+        continue-on-error: true
+
+      - name: 强制应用差分补丁（忽略错误）
+        run: |
+          # 遍历所有发现的补丁文件
+          for patch in $(cat /tmp/patch_list.txt 2>/dev/null || echo ""); do
+            echo "处理补丁: $patch"
+            if echo "$patch" | grep -qi "system"; then
+              TARGET_IMG="${{ env.OUTPUT_DIR }}/system.img"
+              # 如果目标镜像不存在，尝试从 OTA 包中复制一个基础镜像（若有）
+              if [ ! -f "$TARGET_IMG" ]; then
+                find ${{ env.WORK_DIR }}/ota_extracted -type f -name "system.img" -exec cp {} ${{ env.OUTPUT_DIR }}/ \; || echo "未找到基础 system.img"
+              fi
+              # 应用补丁，忽略所有错误
+              python3 /tmp/imgpatchtools/applypatch.py "$patch" "$TARGET_IMG" 2>/dev/null || echo "system.img 补丁应用失败（已忽略）"
+            elif echo "$patch" | grep -qi "vendor"; then
+              TARGET_IMG="${{ env.OUTPUT_DIR }}/vendor.img"
+              if [ ! -f "$TARGET_IMG" ]; then
+                find ${{ env.WORK_DIR }}/ota_extracted -type f -name "vendor.img" -exec cp {} ${{ env.OUTPUT_DIR }}/ \; || echo "未找到基础 vendor.img"
+              fi
+              python3 /tmp/imgpatchtools/applypatch.py "$patch" "$TARGET_IMG" 2>/dev/null || echo "vendor.img 补丁应用失败（已忽略）"
+            fi
           done
-          python3 --version
-          gcc --version | head -n 1
-          ldconfig --version | head -n 1
-      - name: Record Environment
-        shell: bash
+        continue-on-error: true
+
+      - name: 处理块级 OTA（payload.bin）
         run: |
-          set -e
-          {
-            echo "===== DATE ====="; date -u
-            echo "===== UNAME ====="; uname -a
-            echo "===== CPU ====="; nproc
-            echo "===== MEMORY ====="; free -h
-            echo "===== DISK ====="; df -h
-            echo "===== PWD ====="; pwd
-            echo "===== WORKSPACE_ROOT ====="; echo "${WORKSPACE_ROOT}"
-            echo "===== ANALYSIS_ROOT ====="; echo "${ANALYSIS_ROOT}"
-            echo "===== ARTIFACT_ROOT ====="; echo "${ARTIFACT_ROOT}"
-            echo "===== PATH ====="; echo "${PATH}"
-            echo "===== LD_LIBRARY_PATH ====="; echo "${LD_LIBRARY_PATH}"
-            echo "===== COMMAND PATHS ====="
-            command -v python3; command -v gcc; command -v g++; command -v make; command -v cmake; command -v file
-            command -v strings; command -v 7z; command -v unzip; command -v tar; command -v xz; command -v gzip
-            command -v bzip2; command -v binwalk; command -v ldconfig
-            echo "===== PYTHON ====="; python3 --version
-            echo "===== GCC ====="; gcc --version | head -n 1
-            echo "===== LD CONFIG ====="; ldconfig --version | head -n 1
-          } | tee "${ARTIFACT_ROOT}/logs/environment.txt"
-      - name: Build Radare2
-        shell: bash
-        run: |
-          set -e
-          rm -rf /tmp/radare2
-          git clone --depth 1 https://github.com/radareorg/radare2.git /tmp/radare2
-          cd /tmp/radare2
-          ./configure --prefix=/usr/local
-          make -j"$(nproc)"
-          make install
-          cd /
-          rm -rf /tmp/radare2
-          export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-          export LD_LIBRARY_PATH="/usr/local/lib:/usr/lib:/lib"
-          ldconfig
-          if ! command -v r2 >/dev/null 2>&1; then echo "r2 missing"; exit 1; fi
-          if ! command -v rabin2 >/dev/null 2>&1; then echo "rabin2 missing"; exit 1; fi
-          r2 -v
-          rabin2 -v
-          {
-            echo "r2=$(command -v r2)"
-            echo "rabin2=$(command -v rabin2)"
-            r2 -v
-            rabin2 -v
-          } > "${ARTIFACT_ROOT}/logs/radare2.txt"
-      - name: Install Python Libraries
-        shell: bash
-        run: |
-          set -e
-          python3 -m pip install --upgrade pip setuptools wheel
-          python3 -m pip install r2pipe pefile capstone pyelftools pycryptodome unicorn python-magic
-          python3 - <<'PYEOF'
-          import importlib
-          for m in ["r2pipe","pefile","capstone","elftools","Crypto","unicorn","magic"]:
-              importlib.import_module(m)
-              print("OK:", m)
-          PYEOF
-      - name: Download and Prepare Kernel Image (Split zImage & dtb)
-        shell: bash
-        run: |
-          set -e
-          if [ -z "${KERNEL_URL}" ]; then echo "KERNEL_URL empty"; exit 1; fi
-          rm -f "${ANALYSIS_ROOT}/input/kernel.download"
-          curl --fail --location --retry 10 --retry-delay 5 --retry-all-errors --connect-timeout 30 --max-time 3600 \
-               --output "${ANALYSIS_ROOT}/input/kernel.download" "${KERNEL_URL}"
-          if [ ! -f "${ANALYSIS_ROOT}/input/kernel.download" ]; then echo "Download failed"; exit 1; fi
-          SIZE=$(stat -c '%s' "${ANALYSIS_ROOT}/input/kernel.download")
-          if [ "${SIZE}" -le 0 ]; then echo "Empty file"; exit 1; fi
-          echo "Size=${SIZE}"
-          file "${ANALYSIS_ROOT}/input/kernel.download"
-          sha256sum "${ANALYSIS_ROOT}/input/kernel.download" > "${ARTIFACT_ROOT}/logs/source_sha256.txt"
-          md5sum "${ANALYSIS_ROOT}/input/kernel.download" > "${ARTIFACT_ROOT}/logs/source_md5.txt"
-          mkdir -p "${ANALYSIS_ROOT}/input/extract"
-          if file "${ANALYSIS_ROOT}/input/kernel.download" | grep -q "Zip archive"; then
-            unzip -q "${ANALYSIS_ROOT}/input/kernel.download" -d "${ANALYSIS_ROOT}/input/extract"
-            KERNEL_FILE=$(find "${ANALYSIS_ROOT}/input/extract" -type f -size +1M | head -1)
-            if [ -z "${KERNEL_FILE}" ]; then echo "No large file found in zip"; exit 1; fi
-            mv "${KERNEL_FILE}" "${ANALYSIS_ROOT}/input/kernel_image_raw"
-          else
-            cp "${ANALYSIS_ROOT}/input/kernel.download" "${ANALYSIS_ROOT}/input/kernel_image_raw"
+          if [ -f "${{ env.WORK_DIR }}/ota_extracted/payload.bin" ]; then
+            echo "检测到 payload.bin，尝试复制"
+            cp ${{ env.WORK_DIR }}/ota_extracted/payload.bin ${{ env.OUTPUT_DIR }}/ || echo "payload.bin 复制失败"
           fi
-          if file "${ANALYSIS_ROOT}/input/kernel_image_raw" | grep -q "gzip compressed"; then
-            gunzip -c "${ANALYSIS_ROOT}/input/kernel_image_raw" > "${ANALYSIS_ROOT}/input/kernel_image_uncompressed" || true
-          else
-            cp "${ANALYSIS_ROOT}/input/kernel_image_raw" "${ANALYSIS_ROOT}/input/kernel_image_uncompressed"
-          fi
-          python3 - <<'SPLIT_PY'
-          import os, sys
-          infile = os.environ['ANALYSIS_ROOT'] + '/input/kernel_image_uncompressed'
-          out_zimage = os.environ['ANALYSIS_ROOT'] + '/input/zImage'
-          out_dtb = os.environ['ANALYSIS_ROOT'] + '/input/dtb'
-          with open(infile, 'rb') as f:
-              data = f.read()
-          magic = b'\xd0\x0d\xfe\xed'
-          idx = data.find(magic)
-          if idx != -1:
-              with open(out_zimage, 'wb') as f:
-                  f.write(data[:idx])
-              with open(out_dtb, 'wb') as f:
-                  f.write(data[idx:])
-              print(f"Split zImage and dtb at offset {idx}")
-          else:
-              with open(out_zimage, 'wb') as f:
-                  f.write(data)
-              print("No DTB magic; using whole file as zImage")
-              open(out_dtb, 'wb').close()
-          SPLIT_PY
-          if [ ! -s "${ANALYSIS_ROOT}/input/zImage" ]; then echo "Failed to obtain zImage"; exit 1; fi
-          file "${ANALYSIS_ROOT}/input/zImage"
-      - name: Create Kernel Analysis Script
-        shell: bash
+        continue-on-error: true
+
+      - name: 收集所有相关文件（镜像、补丁、更新脚本等）
         run: |
-          set -e
-          cat > /tmp/kernel_analysis.py <<'PYEOF'
-          import os,sys,json,shutil,subprocess,re,hashlib
-          from pathlib import Path
-          import r2pipe
-          ANALYSIS_ROOT=Path(os.environ["ANALYSIS_ROOT"])
-          ARTIFACT_ROOT=Path(os.environ["ARTIFACT_ROOT"])
-          ZIMAGE=ANALYSIS_ROOT/"input/zImage"
-          EXTRACT_ROOT=ANALYSIS_ROOT/"extracted"
-          REPORT_ROOT=ARTIFACT_ROOT/"reports"
-          LOG_ROOT=ARTIFACT_ROOT/"logs"
-          READ_CHUNK=1024*1024
-          ELF_MAGIC=b'\x7fELF'
-          GZIP_MAGIC=b'\x1f\x8b'
-          XZ_MAGIC=b'\xfd7zXZ\x00'
+          # 复制所有 .img, .patch, .dat 文件
+          find ${{ env.WORK_DIR }}/ota_extracted -type f \( -name "*.img" -o -name "*.patch" -o -name "*.dat" \) -exec cp {} ${{ env.OUTPUT_DIR }}/ \; 2>/dev/null || true
+          # 复制 updater-script（若有）
+          find ${{ env.WORK_DIR }}/ota_extracted -type f -name "updater-script" -exec cp {} ${{ env.OUTPUT_DIR }}/ \; 2>/dev/null || true
+          # 列出输出目录内容
+          ls -la ${{ env.OUTPUT_DIR }}/ || echo "输出目录为空"
+        continue-on-error: true
 
-          def run_cmd(cmd,timeout=300):
-              try:
-                  r=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,errors="replace",timeout=timeout)
-                  return (r.returncode,r.stdout)
-              except subprocess.TimeoutExpired as e:
-                  return (124,(e.stdout if e.stdout else "")+"\nTIMEOUT\n")
-              except Exception as e:
-                  return (125,str(e))
-
-          def sha256_file(p):
-              h=hashlib.sha256()
-              with open(p,"rb") as f:
-                  while True:
-                      c=f.read(READ_CHUNK)
-                      if not c: break
-                      h.update(c)
-              return h.hexdigest()
-
-          def find_magic(data, magic):
-              return data.find(magic)
-
-          def decompress_gzip(data):
-              try:
-                  import gzip, io
-                  return gzip.decompress(data)
-              except:
-                  return None
-
-          def decompress_xz(data):
-              try:
-                  import lzma
-                  return lzma.decompress(data)
-              except:
-                  return None
-
-          def extract_vmlinux_from_zimage(zimage_path):
-              with open(zimage_path,"rb") as f:
-                  data=f.read()
-              if data.startswith(ELF_MAGIC):
-                  return str(zimage_path)
-              gzip_off=data.find(GZIP_MAGIC)
-              if gzip_off!=-1:
-                  gzip_data=data[gzip_off:]
-                  decomp=decompress_gzip(gzip_data)
-                  if decomp and decomp.startswith(ELF_MAGIC):
-                      out=EXTRACT_ROOT/"vmlinux_gzip"
-                      out.parent.mkdir(parents=True,exist_ok=True)
-                      with open(out,"wb") as f: f.write(decomp)
-                      return str(out)
-              xz_off=data.find(XZ_MAGIC)
-              if xz_off!=-1:
-                  xz_data=data[xz_off:]
-                  decomp=decompress_xz(xz_data)
-                  if decomp and decomp.startswith(ELF_MAGIC):
-                      out=EXTRACT_ROOT/"vmlinux_xz"
-                      out.parent.mkdir(parents=True,exist_ok=True)
-                      with open(out,"wb") as f: f.write(decomp)
-                      return str(out)
-              outdir=EXTRACT_ROOT/"binwalk_extract"
-              shutil.rmtree(outdir,ignore_errors=True)
-              outdir.mkdir(parents=True,exist_ok=True)
-              code,out=run_cmd(["binwalk","-Me","--run-as=root","--directory="+str(outdir),str(zimage_path)],1800)
-              for root,_,files in os.walk(outdir):
-                  for f in files:
-                      p=os.path.join(root,f)
-                      if os.path.isfile(p):
-                          with open(p,"rb") as fd:
-                              if fd.read(4)==ELF_MAGIC:
-                                  return p
-              offset=find_magic(data, ELF_MAGIC)
-              if offset!=-1:
-                  elf_data=data[offset:]
-                  out=EXTRACT_ROOT/"vmlinux_direct"
-                  out.parent.mkdir(parents=True,exist_ok=True)
-                  with open(out,"wb") as f: f.write(elf_data)
-                  return str(out)
-              return None
-
-          def r2_cmdj(r2,cmd):
-              try:
-                  v=r2.cmdj(cmd)
-                  return v if v is not None else []
-              except:
-                  return []
-
-          def find_symbol(r2,name):
-              syms=r2_cmdj(r2,"isj")
-              for s in syms:
-                  if s.get("name","")==name:
-                      return s.get("vaddr")
-              return None
-
-          def find_string_xref(r2,string):
-              strings=r2_cmdj(r2,"izzj")
-              addr=None
-              for s in strings:
-                  if s.get("string","")==string:
-                      addr=s.get("vaddr")
-                      break
-              if addr is None: return None
-              xrefs=r2_cmdj(r2,"axtj "+hex(addr))
-              if not xrefs: return None
-              for x in xrefs:
-                  if x.get("type")=="CALL" or x.get("type")=="DATA":
-                      return x.get("addr")
-              return None
-
-          def get_function_disasm(r2,addr):
-              return r2.cmd("pdf @ "+hex(addr))
-
-          def detect_arch(r2):
-              info=r2_cmdj(r2,"ij")
-              arch=info.get("arch","")
-              if arch:
-                  return arch
-              return "arm64"
-
-          def find_offset_from_syscall(r2, syscall_names, arch):
-              for name in syscall_names:
-                  addr = find_symbol(r2, name)
-                  if addr:
-                      dis = get_function_disasm(r2, addr)
-                      # Write disassembly for debugging
-                      with open(LOG_ROOT / "disasm.log", "a") as f:
-                          f.write(f"===== {name} (addr: {hex(addr)}) ====\n{dis}\n\n")
-                      # For ARM64: look for mrs x0, sp_el0 and then ldr with offset
-                      if arch in ["arm", "aarch64", "arm64"]:
-                          lines = dis.split('\n')
-                          found_current = False
-                          for i, line in enumerate(lines):
-                              if "mrs" in line and "sp_el0" in line and "x0" in line:
-                                  found_current = True
-                                  continue
-                              if found_current and ("ldr" in line or "add" in line) and "x0" in line and "#" in line:
-                                  # Try to extract offset
-                                  m = re.search(r"\[x0,\s*#([0-9a-fA-Fx]+)\]", line)
-                                  if m:
-                                      val = m.group(1)
-                                      if val.startswith("0x"):
-                                          return int(val, 16)
-                                      else:
-                                          return int(val, 16)
-                                  # Also look for ldr x0, [x0, #offset] with w0
-                                  m = re.search(r"ldr\s+[wx][0-9]+,\s*\[x0,\s*#([0-9a-fA-Fx]+)\]", line)
-                                  if m:
-                                      val = m.group(1)
-                                      if val.startswith("0x"):
-                                          return int(val, 16)
-                                      else:
-                                          return int(val, 16)
-                          # If not found, try to find any ldr with x0 offset in the function
-                          for line in lines:
-                              if "ldr" in line and "x0" in line and "#" in line:
-                                  m = re.search(r"\[x0,\s*#([0-9a-fA-Fx]+)\]", line)
-                                  if m:
-                                      val = m.group(1)
-                                      if val.startswith("0x"):
-                                          return int(val, 16)
-                                      else:
-                                          return int(val, 16)
-                      else:
-                          # x86 pattern
-                          lines = dis.split('\n')
-                          found_gs = False
-                          for line in lines:
-                              if "gs:" in line and "mov" in line and "rax" in line:
-                                  found_gs = True
-                                  continue
-                              if found_gs and "mov" in line and "rax" in line and "[" in line:
-                                  m = re.search(r"\[rax\+0x([0-9a-fA-F]+)\]", line)
-                                  if m:
-                                      return int(m.group(1), 16)
-                  # If not found, try next syscall name
-              return None
-
-          def analyze_vmlinux(vmlinux_path):
-              r2=None
-              try:
-                  r2=r2pipe.open(str(vmlinux_path),flags=["-2"])
-              except Exception as e:
-                  return {"error":"open failed: "+str(e)}
-              try:
-                  r2.cmd("aaa")
-                  r2.cmd("aac")
-              except:
-                  pass
-              arch=detect_arch(r2)
-              result={"arch":arch}
-              init_nsproxy=find_symbol(r2,"init_nsproxy")
-              if init_nsproxy is None:
-                  init_nsproxy=find_string_xref(r2,"init_nsproxy")
-              selinux_enforcing=find_symbol(r2,"selinux_enforcing")
-              if selinux_enforcing is None:
-                  selinux_enforcing=find_string_xref(r2,"selinux_enforcing")
-              result["init_nsproxy"]=init_nsproxy
-              result["selinux_enforcing"]=selinux_enforcing
-
-              offsets={}
-              syscall_map = {
-                  "task_struct.pid": ["__arm64_sys_getpid", "__se_sys_getpid", "sys_getpid"],
-                  "cred.uid": ["__arm64_sys_getuid", "__se_sys_getuid", "sys_getuid"],
-                  "cred.gid": ["__arm64_sys_getgid", "__se_sys_getgid", "sys_getgid"],
-                  "cred.euid": ["__arm64_sys_geteuid", "__se_sys_geteuid", "sys_geteuid"],
-                  "cred.egid": ["__arm64_sys_getegid", "__se_sys_getegid", "sys_getegid"],
-                  "cred.fsuid": ["__arm64_sys_getfsuid", "__se_sys_getfsuid", "sys_getfsuid"],
-                  "cred.fsgid": ["__arm64_sys_getfsgid", "__se_sys_getfsgid", "sys_getfsgid"],
-                  "task_struct.nsproxy": ["__arm64_sys_setns", "__se_sys_setns", "sys_setns"],
-                  "task_struct.addr_limit": ["__arm64_sys_prctl", "__se_sys_prctl", "sys_prctl"]
-              }
-              for key, names in syscall_map.items():
-                  off = find_offset_from_syscall(r2, names, arch)
-                  if off is not None:
-                      offsets[key] = off
-              result["offsets"]=offsets
-              try:
-                  r2.quit()
-              except:
-                  pass
-              return result
-
-          def main():
-              LOG_ROOT.mkdir(parents=True,exist_ok=True)
-              for d in [EXTRACT_ROOT,REPORT_ROOT,LOG_ROOT]:
-                  d.mkdir(parents=True,exist_ok=True)
-              if not ZIMAGE.is_file() or ZIMAGE.stat().st_size==0:
-                  print("zImage missing or empty"); return 1
-              print("zImage:",ZIMAGE)
-              vmlinux=extract_vmlinux_from_zimage(str(ZIMAGE))
-              if vmlinux is None:
-                  print("vmlinux extraction failed")
-                  return 3
-              print("vmlinux:",vmlinux)
-              analysis=analyze_vmlinux(vmlinux)
-              report=REPORT_ROOT/"kernel_offsets.json"
-              with open(report,"w") as f:
-                  json.dump(analysis,f,indent=2)
-              print("Analysis complete")
-              return 0
-          if __name__=="__main__":
-              sys.exit(main())
-          PYEOF
-          python3 -m py_compile /tmp/kernel_analysis.py
-          chmod +x /tmp/kernel_analysis.py
-      - name: Run Kernel Analysis
-        shell: bash
-        run: |
-          set -e
-          python3 /tmp/kernel_analysis.py 2>&1 | tee "${ARTIFACT_ROOT}/logs/analysis.log"
-      - name: Validate Results
-        if: always()
-        shell: bash
-        run: |
-          set -e
-          if [ ! -f "${ARTIFACT_ROOT}/reports/kernel_offsets.json" ]; then echo "Missing kernel_offsets.json"; exit 1; fi
-          python3 - <<'PYEOF'
-          import json,os
-          with open(os.environ["ARTIFACT_ROOT"]+"/reports/kernel_offsets.json") as f:
-              data=json.load(f)
-          print("arch:",data.get("arch"))
-          print("init_nsproxy:",data.get("init_nsproxy"))
-          print("selinux_enforcing:",data.get("selinux_enforcing"))
-          print("offsets:",data.get("offsets"))
-          if "error" in data:
-              print("ERROR:",data["error"])
-              exit(1)
-          if not data.get("offsets"):
-              print("WARNING: No offsets computed")
-              # Print a snippet of disasm.log if exists
-              disasm_log = os.environ["ARTIFACT_ROOT"]+"/logs/disasm.log"
-              if os.path.exists(disasm_log):
-                  with open(disasm_log, "r") as f:
-                      lines = f.readlines()
-                      print("First 20 lines of disasm.log:")
-                      print("".join(lines[:20]))
-          PYEOF
-      - name: Collect Diagnostics
-        if: always()
-        shell: bash
-        run: |
-          set +e
-          mkdir -p "${ARTIFACT_ROOT}/logs"
-          {
-            echo "===== DATE ====="; date -u
-            echo "===== PWD ====="; pwd
-            echo "===== WORKSPACE_ROOT ====="; echo "${WORKSPACE_ROOT}"
-            echo "===== ANALYSIS_ROOT ====="; echo "${ANALYSIS_ROOT}"
-            echo "===== ARTIFACT_ROOT ====="; echo "${ARTIFACT_ROOT}"
-            echo "===== UNAME ====="; uname -a
-            echo "===== CPU ====="; nproc
-            echo "===== MEMORY ====="; free -h
-            echo "===== DISK ====="; df -h
-            echo "===== TOOLS ====="
-            for cmd in r2 rabin2 ldconfig python3 file strings 7z unzip tar xz gzip bzip2 binwalk; do
-              if command -v "${cmd}" >/dev/null 2>&1; then echo "${cmd}=$(command -v "${cmd}")"; else echo "${cmd}=NOT_FOUND"; fi
-            done
-            echo "===== RADARE2 ====="
-            if command -v r2 >/dev/null 2>&1; then r2 -v; fi
-            if command -v rabin2 >/dev/null 2>&1; then rabin2 -v; fi
-            echo "===== FILE TREE ====="
-            if [ -d "${ARTIFACT_ROOT}" ]; then find "${ARTIFACT_ROOT}" -maxdepth 12 -type f -printf '%p %s bytes\n' | sort; else echo "Artifact root missing"; fi
-          } > "${ARTIFACT_ROOT}/logs/final_diagnostics.log" 2>&1
-      - name: Upload Artifacts
-        if: always()
+      - name: 上传提取结果作为工件（artifact）
         uses: actions/upload-artifact@v4
         with:
-          name: kernel_offset_analysis
-          path: |
-            artifacts/**
-          if-no-files-found: warn
-          retention-days: 30
-          compression-level: 0
-          include-hidden-files: true
-      - name: Success Notice
-        if: success()
-        shell: bash
-        run: echo "::notice title=Kernel Offset Analysis Complete::Offsets computed successfully."
-      - name: Failure Notice
-        if: failure()
-        shell: bash
-        run: echo "::error title=Kernel Offset Analysis Failed::Workflow failed. Artifacts uploaded."; exit 1
+          name: ota_extracted_images
+          path: ${{ env.OUTPUT_DIR }}
+          retention-days: 7
