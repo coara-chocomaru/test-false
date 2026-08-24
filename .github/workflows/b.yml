@@ -1,14 +1,6 @@
 name: Extract OTA Images (Android 9)
 
 on:
-  push:
-    branches:
-      - a 
-
-  pull_request:
-    branches:
-      - a
-      
   workflow_dispatch:
     inputs:
       ota_url:
@@ -23,22 +15,29 @@ env:
 
 jobs:
   extract:
-    runs-on: ubuntu-22.04  # 使用当前受支持的 Ubuntu LTS 版本
+    runs-on: ubuntu-22.04
     steps:
-      - name: 安装依赖工具
+      - name: 安装系统依赖
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            wget \
-            unzip \
-            python3 \
-            android-sdk-libsparse-utils \
-            bsdiff \
-            git \
-            file
-          # 克隆 imgpatchtools（用于应用差分补丁）
-          git clone https://github.com/erfanoabdi/imgpatchtools.git /tmp/imgpatchtools
-          chmod +x /tmp/imgpatchtools/*.py
+            wget unzip python3 python3-pip \
+            android-sdk-libsparse-utils bsdiff git file \
+            || echo "部分包安装失败，继续..."
+          # 安装 python 必要库
+          pip3 install --upgrade pip
+          pip3 install protobuf || echo "protobuf 安装失败"
+
+      - name: 克隆并准备工具（sdat2img + imgpatchtools）
+        run: |
+          # 克隆 sdat2img
+          git clone https://github.com/xpirt/sdat2img.git /tmp/sdat2img || echo "sdat2img 克隆失败"
+          chmod +x /tmp/sdat2img/sdat2img.py 2>/dev/null || true
+
+          # 克隆 imgpatchtools
+          git clone https://github.com/erfanoabdi/imgpatchtools.git /tmp/imgpatchtools || echo "imgpatchtools 克隆失败"
+          # 查找所有 .py 文件并赋予执行权限
+          find /tmp/imgpatchtools -type f -name "*.py" -exec chmod +x {} \; 2>/dev/null || true
 
       - name: 创建工作目录
         run: |
@@ -47,45 +46,63 @@ jobs:
       - name: 下载 OTA 包
         run: |
           wget --no-check-certificate -O ${{ env.WORK_DIR }}/ota.zip "${{ github.event.inputs.ota_url }}"
-        continue-on-error: true   # 即使下载失败也继续（后续会处理）
+        continue-on-error: true
 
       - name: 解压 OTA 包
         run: |
           unzip -o ${{ env.WORK_DIR }}/ota.zip -d ${{ env.WORK_DIR }}/ota_extracted/ || echo "解压部分文件失败，继续..."
         continue-on-error: true
 
-      - name: 查找差分补丁文件
-        id: find_patches
+      - name: 查找 .new.dat 和 transfer list 文件
+        id: find_newdat
         run: |
-          find ${{ env.WORK_DIR }}/ota_extracted -type f \( -name "*system*.patch" -o -name "*vendor*.patch" -o -name "*.patch.dat" \) > /tmp/patch_list.txt || true
-          cat /tmp/patch_list.txt || echo "未找到补丁文件"
+          # 查找 system.new.dat, vendor.new.dat 以及对应的 transfer list
+          find ${{ env.WORK_DIR }}/ota_extracted -type f \( -name "*.new.dat" -o -name "*.transfer.list" \) > /tmp/newdat_list.txt || true
+          cat /tmp/newdat_list.txt || echo "未找到 .new.dat 或 transfer list 文件"
+
+      - name: 转换 .new.dat 为 .img（使用 sdat2img）
+        run: |
+          # 遍历所有 .new.dat 文件
+          for newdat in $(find ${{ env.WORK_DIR }}/ota_extracted -type f -name "*.new.dat" 2>/dev/null); do
+            echo "处理 $newdat"
+            base=$(basename "$newdat" .new.dat)
+            # 寻找对应的 transfer list
+            transfer=$(find ${{ env.WORK_DIR }}/ota_extracted -type f -name "${base}.transfer.list" | head -1)
+            if [ -f "$transfer" ]; then
+              echo "找到 transfer list: $transfer"
+              # 使用 sdat2img 转换
+              python3 /tmp/sdat2img/sdat2img.py "$transfer" "$newdat" "${{ env.OUTPUT_DIR }}/${base}.img" \
+                2>/dev/null || echo "${base}.img 转换失败（已忽略）"
+            else
+              echo "未找到 ${base}.transfer.list，跳过转换"
+            fi
+          done
         continue-on-error: true
 
-      - name: 提取已存在的完整镜像
+      - name: 直接复制已存在的完整镜像（如果有）
         run: |
           find ${{ env.WORK_DIR }}/ota_extracted -type f -name "system.img" -exec cp {} ${{ env.OUTPUT_DIR }}/ \; || echo "未找到 system.img"
           find ${{ env.WORK_DIR }}/ota_extracted -type f -name "vendor.img" -exec cp {} ${{ env.OUTPUT_DIR }}/ \; || echo "未找到 vendor.img"
         continue-on-error: true
 
-      - name: 强制应用差分补丁（忽略错误）
+      - name: 查找并应用差分补丁（.patch 或 .patch.dat）
         run: |
-          # 遍历所有发现的补丁文件
-          for patch in $(cat /tmp/patch_list.txt 2>/dev/null || echo ""); do
-            echo "处理补丁: $patch"
+          # 收集所有补丁文件
+          find ${{ env.WORK_DIR }}/ota_extracted -type f \( -name "*.patch" -o -name "*.patch.dat" \) > /tmp/patch_list.txt || true
+          for patch in $(cat /tmp/patch_list.txt 2>/dev/null); do
+            echo "尝试应用补丁: $patch"
+            # 根据文件名推测目标分区
             if echo "$patch" | grep -qi "system"; then
               TARGET_IMG="${{ env.OUTPUT_DIR }}/system.img"
-              # 如果目标镜像不存在，尝试从 OTA 包中复制一个基础镜像（若有）
-              if [ ! -f "$TARGET_IMG" ]; then
-                find ${{ env.WORK_DIR }}/ota_extracted -type f -name "system.img" -exec cp {} ${{ env.OUTPUT_DIR }}/ \; || echo "未找到基础 system.img"
-              fi
-              # 应用补丁，忽略所有错误
-              python3 /tmp/imgpatchtools/applypatch.py "$patch" "$TARGET_IMG" 2>/dev/null || echo "system.img 补丁应用失败（已忽略）"
+              # 如果目标不存在，跳过
+              [ -f "$TARGET_IMG" ] || { echo "system.img 不存在，跳过补丁"; continue; }
+              python3 /tmp/imgpatchtools/applypatch.py "$patch" "$TARGET_IMG" 2>/dev/null \
+                || echo "system.img 补丁应用失败（忽略）"
             elif echo "$patch" | grep -qi "vendor"; then
               TARGET_IMG="${{ env.OUTPUT_DIR }}/vendor.img"
-              if [ ! -f "$TARGET_IMG" ]; then
-                find ${{ env.WORK_DIR }}/ota_extracted -type f -name "vendor.img" -exec cp {} ${{ env.OUTPUT_DIR }}/ \; || echo "未找到基础 vendor.img"
-              fi
-              python3 /tmp/imgpatchtools/applypatch.py "$patch" "$TARGET_IMG" 2>/dev/null || echo "vendor.img 补丁应用失败（已忽略）"
+              [ -f "$TARGET_IMG" ] || { echo "vendor.img 不存在，跳过补丁"; continue; }
+              python3 /tmp/imgpatchtools/applypatch.py "$patch" "$TARGET_IMG" 2>/dev/null \
+                || echo "vendor.img 补丁应用失败（忽略）"
             fi
           done
         continue-on-error: true
@@ -93,22 +110,24 @@ jobs:
       - name: 处理块级 OTA（payload.bin）
         run: |
           if [ -f "${{ env.WORK_DIR }}/ota_extracted/payload.bin" ]; then
-            echo "检测到 payload.bin，尝试复制"
-            cp ${{ env.WORK_DIR }}/ota_extracted/payload.bin ${{ env.OUTPUT_DIR }}/ || echo "payload.bin 复制失败"
+            echo "检测到 payload.bin，复制到输出目录"
+            cp ${{ env.WORK_DIR }}/ota_extracted/payload.bin ${{ env.OUTPUT_DIR }}/ || echo "复制 payload.bin 失败"
           fi
         continue-on-error: true
 
-      - name: 收集所有相关文件（镜像、补丁、更新脚本等）
+      - name: 收集所有相关文件（镜像、补丁、脚本等）
         run: |
-          # 复制所有 .img, .patch, .dat 文件
-          find ${{ env.WORK_DIR }}/ota_extracted -type f \( -name "*.img" -o -name "*.patch" -o -name "*.dat" \) -exec cp {} ${{ env.OUTPUT_DIR }}/ \; 2>/dev/null || true
-          # 复制 updater-script（若有）
-          find ${{ env.WORK_DIR }}/ota_extracted -type f -name "updater-script" -exec cp {} ${{ env.OUTPUT_DIR }}/ \; 2>/dev/null || true
-          # 列出输出目录内容
+          # 复制所有 .img, .patch, .dat, .list, .sh 等
+          find ${{ env.WORK_DIR }}/ota_extracted -type f \( -name "*.img" -o -name "*.patch" -o -name "*.dat" -o -name "*.list" \) \
+            -exec cp {} ${{ env.OUTPUT_DIR }}/ \; 2>/dev/null || true
+          # 复制 updater-script 和 metadata
+          find ${{ env.WORK_DIR }}/ota_extracted -type f \( -name "updater-script" -o -name "metadata" \) \
+            -exec cp {} ${{ env.OUTPUT_DIR }}/ \; 2>/dev/null || true
+          # 显示输出目录内容
           ls -la ${{ env.OUTPUT_DIR }}/ || echo "输出目录为空"
         continue-on-error: true
 
-      - name: 上传提取结果作为工件（artifact）
+      - name: 上传工件
         uses: actions/upload-artifact@v4
         with:
           name: ota_extracted_images
