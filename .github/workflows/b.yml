@@ -7,7 +7,7 @@ on:
         description: 'OTA 包的下载链接（支持 .zip 或 .bin）'
         required: true
         type: string
-        default: 'https://example.com/ota_update.zip'
+        default: 'http://d15ze2y2hx4s9h.cloudfront.net/platforms/v2/szj_js202/com.justsystems.smilehs.platform/stable/SZJ-JS202_1.000JS.0072.a_user_to_1.032JS.0090.a_user.zip'
 
 env:
   WORK_DIR: 'ota_work'
