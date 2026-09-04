@@ -25,10 +25,10 @@ import usb.core
 import usb.util
 
 # -- Kyocera USB IDs --
-VID = 0x0482
+VID = 0x05C6
 PID_ADB = 0x0A9B
 PID_CDROM = 0x0A8F
-PID_DIAG = 0x0A9D
+PID_DIAG = 0x090B8
 
 # -- Diag protocol constants --
 DIAG_SUBSYS_CMD_F = 0x4B
