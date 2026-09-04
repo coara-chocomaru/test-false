@@ -14,8 +14,8 @@ from . import hdlc
 logger = logging.getLogger("kdiag.diag")
 
 # USB identifiers
-KYOCERA_VID = 0x0482
-PID_DIAG = 0x0A9D  # Diag mode
+KYOCERA_VID = 0x05C6
+PID_DIAG = 0x90B8  # Diag mode
 PID_CDROM = 0x0A8F  # CDROM mode
 PID_CHARGE = 0x0A9B  # Regular "Charge only" mode
 
